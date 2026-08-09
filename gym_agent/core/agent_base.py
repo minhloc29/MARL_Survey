@@ -344,6 +344,14 @@ class AgentBase(ABC, Generic[ObsType, ActType]):
         self.current_scores = np.zeros(self.num_envs, dtype=np.float32)
         self.current_episode_lengths = np.zeros(self.num_envs, dtype=np.int32)
 
+        # Explicit camera-coverage tracking. Each env step yields per-camera
+        # coverage from MATE's info['infos'][c]['coverage_rate']; we average it
+        # across cameras, accumulate per-episode, and record on episode end so
+        # wandb gets a real coverage curve (not just the reward, which we keep
+        # in `scores` as before).
+        self.current_coverage = np.zeros(self.num_envs, dtype=np.float32)
+        self.coverage_list: list[float] = []
+
         self.save_kwargs: list[str] = []
 
         self._last_obs: np.ndarray = None
@@ -906,6 +914,14 @@ class AgentBase(ABC, Generic[ObsType, ActType]):
                 "rollout/score",
                 self.scores[-1] if len(self.scores) > 0 else None,
             )
+            self.logger.record(
+                "rollout/avg_coverage",
+                np.mean(self.coverage_list[-self._mean_score_window :]) if self.coverage_list else None,
+            )
+            self.logger.record(
+                "rollout/coverage",
+                self.coverage_list[-1] if self.coverage_list else None,
+            )
 
             if wandb_run is not None:
                 wandb_run.log(
@@ -918,6 +934,8 @@ class AgentBase(ABC, Generic[ObsType, ActType]):
                         "time/fps": fps,
                         "rollout/avg_score": avg_score,
                         "rollout/score": self.scores[-1] if len(self.scores) > 0 else None,
+                        "rollout/avg_coverage": np.mean(self.coverage_list[-self._mean_score_window :]) if self.coverage_list else None,
+                        "rollout/coverage": self.coverage_list[-1] if self.coverage_list else None,
                     },
                     step=self.timesteps,
                 )
@@ -1156,6 +1174,21 @@ class OffPolicyAgent(AgentBase[ObsType, ActType]):
 
             self.memory.add(self._last_obs, actions, rewards, terminated)
 
+            # Accumulate per-env coverage (mean across cameras) from MATE's
+            # info['infos'][c]['coverage_rate']. `info` is a list, one dict per
+            # env (DummyVecEnv/SubprocVecEnv both return a list here).
+            for env_idx, info_i in enumerate(info):
+                cam_infos = info_i.get("infos")
+                if cam_infos:
+                    self.current_coverage[env_idx] += float(
+                        np.mean(
+                            [
+                                c.get("coverage_rate", 0.0)
+                                for c in cam_infos
+                            ]
+                        )
+                    )
+
             self._last_obs = next_obs
             self._last_episode_starts = np.array(
                 terminated | truncated
@@ -1174,6 +1207,15 @@ class OffPolicyAgent(AgentBase[ObsType, ActType]):
             # reset the current score for that env
             self.current_scores[self._last_episode_starts] = 0.0
             self.current_episode_lengths[self._last_episode_starts] = 0
+            # record mean per-episode coverage for finished envs, then reset
+            # (current_episode_lengths was already incremented above, so it
+            # holds this episode's final length)
+            done_mask = self._last_episode_starts & (self.current_episode_lengths > 0)
+            for env_idx in np.flatnonzero(done_mask):
+                self.coverage_list.append(
+                    self.current_coverage[env_idx] / self.current_episode_lengths[env_idx]
+                )
+            self.current_coverage[self._last_episode_starts] = 0.0
             # count how many episodes finished
             episodes += np.sum(self._last_episode_starts)
 

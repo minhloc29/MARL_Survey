@@ -51,10 +51,12 @@ class MateObserver:
 
         Returns:
             A list of ``num_cameras`` dicts, each keyed by entity kind and
-            holding ``(entities, valid_mask)`` tuples:
-              - "targets":    (num_targets, 5), mask (num_targets,)
-              - "obstacles":  (num_obstacles, 4), mask (num_obstacles,)
-              - "teammates":  (num_cameras, 7), mask (num_cameras,)  # incl. self
+            holding ``(entities, valid_mask)`` tuples. ``valid_mask`` is the
+            sensed bit (last column of each entity row) — rows outside a
+            camera's sensing range are masked out:
+              - "targets":    (num_targets, 5), mask from col -1
+              - "obstacles":  (num_obstacles, 4), mask from col -1
+              - "teammates":  (num_cameras, 7), mask from col -1 (incl. self)
         """
         results = []
         for c in range(self.num_cameras):
@@ -70,9 +72,11 @@ class MateObserver:
             ):
                 raw = obs[self._slices[kind]]
                 entities = self._to_entities(raw, n_ent)
-                # For the skeleton, all fixed slots are treated as present.
-                # (Refine later to gate on the per-entity seen/tracked flag.)
-                valid = np.ones(entities.shape[0], dtype=bool)
+                # The *_with_mask slices append a sensed/seen bit as the LAST
+                # column of each entity row. Rows whose bit is 0 are out of a
+                # camera's sensing range (stale/zero-filled) and must be masked
+                # out of the entity encoder's attention/pooling.
+                valid = entities[:, -1].astype(bool)
                 items[kind] = (entities, valid)
 
             results.append({"self_state": self_state, "entities": items})

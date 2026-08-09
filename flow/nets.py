@@ -46,6 +46,11 @@ class EntitySetEncoder(nn.Module):
         )
         self.pool_query = nn.Parameter(torch.randn(1, 1, embed_dim) * 0.02)
         self.pool_attn = nn.MultiheadAttention(embed_dim, n_heads, batch_first=True)
+        # Learnable null token appended to every set so the pooling attention
+        # always has at least one unmasked key. Without it, a camera sensing
+        # ZERO entities of a kind (all rows masked) feeds an all-padded key set
+        # into MultiheadAttention -> softmax over -inf -> NaN.
+        self.null_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
 
     def forward(self, entities: torch.Tensor, valid_mask: torch.Tensor) -> torch.Tensor:
         """Encode a batch of entity sets.
@@ -58,10 +63,17 @@ class EntitySetEncoder(nn.Module):
             (B, embed_dim) pooled set embedding.
         """
         x = self.embed(entities)
+        # Append an always-valid null token so the set is never empty.
+        null = self.null_token.expand(x.size(0), -1, -1)
+        x = torch.cat([x, null], dim=1)                     # (B, N_max+1, E)
+        valid = torch.cat(
+            [valid_mask, torch.ones(valid_mask.size(0), 1, device=x.device, dtype=torch.bool)],
+            dim=1,
+        )
         # TransformerEncoderLayer expects key_padding_mask=True at PAD positions.
-        x = self.self_attn(x, src_key_padding_mask=~valid_mask)
+        x = self.self_attn(x, src_key_padding_mask=~valid)
         q = self.pool_query.expand(x.size(0), -1, -1)  # (B, 1, E)
-        pooled, _ = self.pool_attn(q, x, x, key_padding_mask=~valid_mask)
+        pooled, _ = self.pool_attn(q, x, x, key_padding_mask=~valid)
         return pooled.squeeze(1)
 
 

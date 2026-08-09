@@ -81,6 +81,13 @@ def main():
         help="Learning rate for the agent's optimizer."
     )
 
+    parser.add_argument(
+        "--device",
+        type=str,
+        default="auto",
+        help="Device to run training on: 'auto', 'cuda', 'mps' (Apple Silicon), or 'cpu'."
+    )
+
 
     parser.add_argument(
         "--num-envs",
@@ -129,6 +136,7 @@ def main():
             num_envs= args.num_envs,
             n_steps=args.n_steps,
             batch_size=args.batch_size,
+            device=args.device,
             log_score_type='mean'
         )
     )
@@ -136,7 +144,7 @@ def main():
     agent.fit(
         total_timesteps=args.total_timesteps,
         save_every=args.save_every,
-        wandb_api=None
+        wandb_api="wandb_v1_UDhL4VvySJ8joPhdZKFgmNsCohZ"
         # wandb_api="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"
     )
 
