@@ -368,6 +368,19 @@ class AgentAsActionWrapper(gym.Wrapper):
             (self.env.unwrapped.num_cameras, self.env.unwrapped.num_targets)
         )  # each camera can choose to have a goal for each target or not, action is a binary vector of shape (num_cameras * num_targets), where each entry is 1 if the corresponding camera has a goal for the corresponding target, and 0 otherwise
 
+    def _to_goal_mask(self, goals) -> list[list[bool]]:
+        """Normalize raw goal actions into a (num_cameras, num_targets) bool mask.
+
+        The policy emits continuous logits of shape (B, C, T); each camera's goal row
+        is `logits[:, c, :] > 0`. When logits are missing (e.g. plain Python lists of
+        bools), they are passed through unchanged.
+        """
+        if isinstance(goals, np.ndarray) and goals.ndim >= 3:
+            # Drop the leading singleton batch dimension, then threshold the logits.
+            mask = goals[0] > 0 if goals.shape[0] == 1 else (goals > 0)
+            return mask.astype(bool).tolist()
+        return goals
+
     def reset(self, **kwargs):
         obs, info = self.env.reset(**kwargs)
         self.info = info
@@ -382,6 +395,9 @@ class AgentAsActionWrapper(gym.Wrapper):
 
     def step(self, goals: list[list[bool]]):
         # actions = np.ndarray([self.unwrapped.num_cameras, 2])
+
+        # Binarize the raw continuous goals from the network (B, C, T) -> (C, T) bool mask.
+        goals = self._to_goal_mask(goals)
 
         # # group observe
         for i in range(len(self.agents)):

@@ -181,9 +181,9 @@ class ExpandedEncoderBlock(nn.Module):
         # tar_emb: T x embed_dim
         # wh_emb: W x embed_dim
 
-        tar_attn_out, _ = self.target_attn(cam_emb, tar_emb)  # C x embed_dim
-        obs_attn_out, _ = self.obstacle_attn(tar_attn_out, obs_emb)  # C x embed_dim
-        wh_attn_out, _ = self.warehouse_attn(tar_attn_out, wh_emb)  # C x embed_dim
+        tar_attn_out = self.target_attn(cam_emb, tar_emb)  # C x embed_dim
+        obs_attn_out = self.obstacle_attn(tar_attn_out, obs_emb)  # C x embed_dim
+        wh_attn_out = self.warehouse_attn(tar_attn_out, wh_emb)  # C x embed_dim
 
         concat_attn_out = torch.cat(
             [obs_attn_out, wh_attn_out], dim=-1

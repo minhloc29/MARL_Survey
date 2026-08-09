@@ -4,6 +4,7 @@ import mate
 from agents import GreedyCameraAgent
 from mate.agents import GreedyTargetAgent
 from wrapper import NetWrapper, AgentAsActionWrapper
+from agents.base import GoalsBaseAgent
 from gym_agent.core.polices import ActorCriticPolicy
 from net import Net, FeatureExtractor
 from common_net.attentions import MHAConfig
@@ -53,7 +54,11 @@ def make_env(**kwargs):
     env = mate.MultiCamera.make(base_env, target_agent=GreedyTargetAgent())
 
     return NetWrapper(
-        AgentAsActionWrapper(env, GreedyCameraAgent().spawn(env.unwrapped.num_cameras)),
+        AgentAsActionWrapper(
+            env,
+            [GoalsBaseAgent(executor=GreedyCameraAgent())
+             for _ in range(env.unwrapped.num_cameras)],
+        ),
         reward_type="coverage_rate",
     )
 
@@ -131,7 +136,8 @@ def main():
     agent.fit(
         total_timesteps=args.total_timesteps,
         save_every=args.save_every,
-        wandb_api="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"
+        wandb_api=None
+        # wandb_api="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"
     )
 
 if __name__ == "__main__":

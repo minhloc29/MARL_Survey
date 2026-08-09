@@ -1,0 +1,17 @@
+{
+  "os": "macOS-15.6.1-arm64-arm-64bit-Mach-O",
+  "python": "CPython 3.13.0",
+  "startedAt": "2026-08-09T01:54:17.927836Z",
+  "program": "/Users/macbook/Documents/Code/MATE/train.py",
+  "codePath": "train.py",
+  "codePathLocal": "train.py",
+  "git": {
+    "remote": "https://github.com/trinhminh11/MATE.git",
+    "commit": "9fc83c0049c90c7e06ce6e8be6096f25b75a72b0"
+  },
+  "email": "trinhtheminh1104@gmail.com",
+  "root": "/Users/macbook/Documents/Code/MATE",
+  "host": "May-tinh-xach-tay-cua-macbook.local",
+  "executable": "/Users/macbook/Documents/Code/MATE/.venv/bin/python",
+  "writerId": "j4o72tj2zu1evo9kkwm64rai92imw2nv"
+}
