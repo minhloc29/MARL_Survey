@@ -11,7 +11,6 @@ from mate.wrappers import MultiCamera
 
 
 def combine_targets(targets_list: np.ndarray):
-    # targets_list: (num_cameras, num_targets, target_state_dim_per_target)
 
     targets = targets_list[0]  # T x target_dim
 

@@ -2,6 +2,7 @@
 
 from .nets import (
     CameraObsEncoder,
+    DeterministicActor,
     EntitySetEncoder,
     IndividualCritic,
     MonotonicMixer,
@@ -19,6 +20,7 @@ from .replay import ReplayBuffer
 
 __all__ = [
     "CameraObsEncoder",
+    "DeterministicActor",
     "EntitySetEncoder",
     "IndividualCritic",
     "MonotonicMixer",

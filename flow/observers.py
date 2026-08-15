@@ -15,13 +15,7 @@ from mate.constants import Team, observation_slices_of
 
 
 class MateObserver:
-    """Turn a raw (num_cameras, obs_dim) joint observation into per-camera dicts.
-
-    Args:
-        num_cameras: number of camera agents.
-        num_targets: number of targets.
-        num_obstacles: number of obstacles.
-    """
+   
 
     def __init__(self, num_cameras: int, num_targets: int, num_obstacles: int):
         self.num_cameras = num_cameras

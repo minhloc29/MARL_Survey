@@ -1,26 +1,3 @@
-"""CLI for the MAC-Flow (flow-matching CTDE) algorithm on MATE's camera team.
-
-Drives MATE's camera team with per-agent LOW-LEVEL continuous actions (a 2-dim
-Box per camera), collected into a replay buffer, training three stages jointly:
-
-  Stage 1  joint flow policy       (advantage-weighted flow-matching BC)
-  Stage 2  per-agent IGM critics   (TD with flow-sampled next actions)
-  Stage 3  one-step policies       (distilled from the flow)
-
-Subcommands:
-
-    train     train and periodically save checkpoints
-    evaluate  load a checkpoint, run the learned one-step policies, report stats
-    render    load a checkpoint, play one rollout with pygame rendering
-
-Examples:
-
-    python train_flow.py train --steps 5000 --save-every 1000 --outdir ckpts
-    python train_flow.py train --steps 5000 --resume ckpts/step_3000.pt
-    python train_flow.py evaluate --checkpoint ckpts/step_5000.pt --episodes 20
-    python train_flow.py render   --checkpoint ckpts/step_5000.pt
-"""
-
 from __future__ import annotations
 
 import argparse
@@ -103,32 +80,35 @@ class RunningMeanStd:
         return obj
 
     def normalize(self, x: torch.Tensor, clip: float = 5.0) -> torch.Tensor:
-        return torch.clamp(x / self.std, -clip, clip)
+        """Standardize rewards to ~zero mean / unit std before building TD targets.
+
+        Centering is important: an uncentered denominator only rescales, it does
+        not remove the systematic offset, which otherwise biases bootstrapped
+        value targets and makes them scale-dependent as reward magnitude drifts.
+        """
+        return torch.clamp((x - self.mean) / self.std, -clip, clip)
 
 
 # --------------------------------------------------------------------------
 # Shared observation encoder helper.
+#
+# Parsing is pure-numpy Python work (the CPU bottleneck), while the CamObsEncoder
+# forward is torch/GPU. We split the two so a batch that must be encoded more
+# than once per update (the shared encoder is stepped in-place between stages,
+# forcing a re-forward) is only ever parsed once.
 # --------------------------------------------------------------------------
-def encode_obs(observer, camera_encoder, joint_obs_np, device):
-    """Encode a batch of joint observations into per-camera embeddings.
+def parse_obs(observer, joint_obs_np):
+    """(B, C, obs_dim) -> list of B per-camera parse results (numpy only)."""
+    return [observer.parse(joint_obs_np[b]) for b in range(joint_obs_np.shape[0])]
 
-    Args:
-        observer: MateObserver.
-        camera_encoder: shared CameraObsEncoder.
-        joint_obs_np: (B, num_cameras, obs_dim) float64 np.
-        device: torch device.
 
-    Returns:
-        list of num_cameras tensors, each (B, camera_encoder.out_dim).
-    """
-    B, C, _ = joint_obs_np.shape
-    # Parse each of the B joint observations once; every camera then indexes
-    # into the cached per-camera results, avoiding C-fold redundant parsing.
-    parsed_batch = [observer.parse(joint_obs_np[b]) for b in range(B)]
+def encode_parsed(camera_encoder, parsed_batch, device):
+    """Torch-encode an already-parsed batch -> list of C tensors, each (B, out_dim)."""
+    B = len(parsed_batch)
+    C = len(parsed_batch[0])
     cam_embs = []
     for c in range(C):
         self_states = np.stack([parsed_batch[b][c]["self_state"] for b in range(B)])
-        # Build padded entity dicts + masks per camera c, per kind.
         entities = {}
         masks = {}
         kinds = list(parsed_batch[0][c]["entities"])
@@ -149,6 +129,11 @@ def encode_obs(observer, camera_encoder, joint_obs_np, device):
         masks_t = {k: torch.as_tensor(v, dtype=torch.bool, device=device) for k, v in masks.items()}
         cam_embs.append(camera_encoder(self_state_t, entities_t, masks_t))
     return cam_embs
+
+
+def encode_obs(observer, camera_encoder, joint_obs_np, device):
+    """Parse + encode: (B, C, obs_dim) -> list of C (B, out_dim) tensors."""
+    return encode_parsed(camera_encoder, parse_obs(observer, joint_obs_np), device)
 
 
 def polyak_update(target, source, tau: float):
@@ -223,7 +208,8 @@ def checkpoint_config_dict(num_cameras, num_targets, num_obstacles,
 
 
 def save_checkpoint(path: str, models: dict, optimizers: dict, reward_norm,
-                    step: int, ep_count: int, config: dict) -> None:
+                    step: int, ep_count: int, config: dict, replay=None,
+                    episode_stats=None) -> None:
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     torch.save(
         {
@@ -236,6 +222,8 @@ def save_checkpoint(path: str, models: dict, optimizers: dict, reward_norm,
             "reward_norm": reward_norm.to_dict() if reward_norm is not None else None,
             "step": step,
             "ep_count": ep_count,
+            "replay": replay.to_dict() if replay is not None else None,
+            "episode_stats": episode_stats or None,
         },
         path,
     )
@@ -274,21 +262,21 @@ def add_model_args(parser):
 def add_train_args(parser):
     parser.add_argument("--steps", type=int, default=5000)
     parser.add_argument("--warmup", type=int, default=1000)
-    parser.add_argument("--batch-size", type=int, default=64)
+    parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--replay-capacity", type=int, default=100_000)
     parser.add_argument("--lr", type=float, default=3e-4)
-    parser.add_argument("--gamma", type=float, default=0.99)
+    parser.add_argument("--gamma", type=float, default=0.96)
     parser.add_argument("--tau", type=float, default=0.005)
-    parser.add_argument("--alpha", type=float, default=3.0)
+    parser.add_argument("--alpha", type=float, default=0.3)
     parser.add_argument("--adv-beta", type=float, default=1.0,
                         help="Advantage temperature for advantage-weighted flow-BC.")
     parser.add_argument("--flow-steps", type=int, default=10)
     parser.add_argument("--log-every", type=int, default=200)
-    parser.add_argument("--save-every", type=int, default=1000)
+    parser.add_argument("--save-every", type=int, default=100000)
     parser.add_argument("--outdir", default="ckpts")
     parser.add_argument("--resume", default=None,
                         help="Path to a checkpoint to resume training from.")
-    parser.add_argument("--wandb-api", default=None,
+    parser.add_argument("--wandb-api", default="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",
                         help="If set, log training curves to Weights & Biases (a wandb API key).")
     parser.add_argument("--seed", type=int, default=0)
 
@@ -326,6 +314,8 @@ def parse_arguments(argv=None):
 def cmd_train(args):
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
+    if torch.cuda.is_available():
+        torch.backends.cudnn.benchmark = True  # autotune fixed input shapes on GPU
     device = torch.device(args.device)
 
     # Optional W&B dashboard. Off by default to avoid forcing a login.
@@ -357,22 +347,17 @@ def cmd_train(args):
         args.embed_dim, obs_dim_out,
     )
 
-    # Three separate optimizers so the actor's -Q_tot objective only ever
-    # updates actor/encoder params, never the critic weights (see the note on
-    # critic gradient leak). The shared camera_encoder is intentionally in
-    # both flow_opt and policy_opt -- it is updated by both objectives, which
-    # is fine; what matters is that -Q_tot never flows into the critics.
+ 
     encoder_params = list(camera_encoder.parameters())
     flow_opt = torch.optim.Adam(
         encoder_params + list(velocity_field.parameters()), lr=args.lr
     )
     critic_opt = torch.optim.Adam(list(critics.parameters()), lr=args.lr)
-    policy_opt = torch.optim.Adam(
-        encoder_params + list(policies.parameters()), lr=args.lr
-    )
+    policy_opt = torch.optim.Adam(list(policies.parameters()), lr=args.lr)
     optimizers = {"flow": flow_opt, "critic": critic_opt, "policy": policy_opt}
     replay = ReplayBuffer(args.replay_capacity)
     reward_norm = RunningMeanStd()
+    stats = None  # episode log-stats restored on resume (if saved)
 
     start_step = 0
     ep_count = 0
@@ -385,7 +370,15 @@ def cmd_train(args):
         reward_norm = RunningMeanStd.from_dict(ckpt["reward_norm"])
         start_step = ckpt["step"]
         ep_count = ckpt["ep_count"]
-        print(f"Resumed from {args.resume} at step {start_step}")
+        # Restore the replay buffer (replay-based training genuinely continues
+        # only if the buffer it samples from survives the restart) and the
+        # episode/coverage log stats so the resumed run reports real values
+        # instead of re-living a blank warmup.
+        if ckpt.get("replay") is not None:
+            replay = ReplayBuffer.from_dict(ckpt["replay"])
+        stats = ckpt.get("episode_stats") or {} or None
+        print(f"Resumed from {args.resume} at step {start_step} "
+              f"(buffer {len(replay)})")
 
     observer = MateObserver(num_cameras, num_targets, num_obstacles)
 
@@ -393,10 +386,19 @@ def cmd_train(args):
     obs, _ = env.reset()
     episode_reward = 0.0
     episode_len = 0
-    last_ep_reward = 0.0   # reward of the most recently completed episode
     episode_coverage = 0.0  # summed per-step coverage within the current episode
-    last_ep_coverage = 0.0  # mean coverage of the most recently completed episode
-    running = {"flow": 0.0, "critic": 0.0, "distill": 0.0}
+    # Completed-episode log stats, persisted across resumes so a restarted run
+    # reports real values instead of a blank 0.000. The mid-episode accumulators
+    # above are intentionally NOT persisted (resume restarts mid-episode cleanly).
+    last_ep_reward = 0.0
+    last_ep_coverage = 0.0
+    episode_stats = {"last_ep_reward": last_ep_reward, "last_ep_coverage": last_ep_coverage}
+    if stats:
+        last_ep_reward = stats.get("last_ep_reward", 0.0)
+        last_ep_coverage = stats.get("last_ep_coverage", 0.0)
+        episode_stats.update(stats)
+    running = {"flow": 0.0, "critic": 0.0, "distill": 0.0,
+               "qmax": 0.0, "bc": 0.0, "adv_ess": 0.0}
 
     for step in range(start_step, args.steps):
         obs_np = np.asarray(obs, dtype=np.float64)[None]  # (1, C, obs_dim)
@@ -432,6 +434,8 @@ def cmd_train(args):
         if done or truncated:
             last_ep_reward = episode_reward
             last_ep_coverage = episode_coverage / max(1, episode_len)
+            episode_stats["last_ep_reward"] = last_ep_reward
+            episode_stats["last_ep_coverage"] = last_ep_coverage
             episode_reward = 0.0
             episode_coverage = 0.0
             episode_len = 0
@@ -444,19 +448,33 @@ def cmd_train(args):
             o_np = batch["obs"].cpu().numpy()    # (B, C, obs_dim)
             no_np = batch["next_obs"].cpu().numpy()
 
-            embs = encode_obs(observer, camera_encoder, o_np, device)
-            n_embs = encode_obs(observer, camera_encoder, no_np, device)
+            # Parse each numpy batch ONCE (pure-Python, the CPU bottleneck), then
+            # re-encode the same parse across the training stages. Stage 3 needs a
+            # re-forward of o_np after the shared encoder is stepped in-place, but
+            # re-encodING must not re-parse.
+            parsed_o = parse_obs(observer, o_np)
+            parsed_no = parse_obs(observer, no_np)
+            embs = encode_parsed(camera_encoder, parsed_o, device)
+            n_embs = encode_parsed(camera_encoder, parsed_no, device)
 
             o_joint = torch.cat(embs, dim=-1)     # (B, C*D)
             a_joint = batch["action"].reshape(batch["action"].size(0), -1)
 
             # ---- Stage 2: critics (TD regression only; own optimizer) ----
             with torch.no_grad():
-                a_next_joint = sample_joint_flow(
-                    velocity_field, torch.cat(n_embs, dim=-1),
-                    act_dim=joint_act_dim, steps=args.flow_steps,
+                # Bootstrap on the deterministic ONE-STEP policy's action at s',
+                # not a random draw from the flow. This matches what is actually
+                # deployed (the actor executes one-step policies), so the value
+                # target is the return of the real policy rather than of a random
+                # flow sample. A random next-action inflates the target (a
+                # positive-bias bootstrap) and contributes to the critic
+                # overestimation seen as Q_tot pinning to a constant +3.
+                a_next_slices = split_per_agent(
+                    torch.stack(
+                        [p(no) for p, no in zip(policies, n_embs)], dim=-1
+                    ),
+                    num_cameras, args.act_dim,
                 )
-                a_next_slices = split_per_agent(a_next_joint, num_cameras, args.act_dim)
                 q_next_list = torch.stack(
                     [tc(no, a) for tc, no, a in zip(target_critics, n_embs, a_next_slices)],
                     dim=-1,
@@ -488,7 +506,7 @@ def cmd_train(args):
             critic_opt.step()
 
             # ---- Stage 1: advantage-weighted flow BC (flow + encoder) ----
-            loss_flow = advantage_weighted_flow_bc_loss(
+            loss_flow, adv_w_ess = advantage_weighted_flow_bc_loss(
                 velocity_field, o_joint, a_joint, advantage, beta=args.adv_beta
             )
             flow_opt.zero_grad()
@@ -498,11 +516,15 @@ def cmd_train(args):
             # ---- Stage 3: distill joint flow -> one-step policies ----
             # Freeze critics so the -Q_tot actor term cannot push gradients
             # into the critic weights (only into policy + shared encoder).
-            # The shared camera_encoder is updated in-place by flow_opt.step()
-            # above, which invalidates the graph of the earlier `embs`; re-encode
-            # so the actor's backward has a fresh, valid encoder graph.
-            with torch.no_grad():
-                embs_v2 = encode_obs(observer, camera_encoder, o_np, device)
+            # NOTE: re-encode WITH gradients, NOT under no_grad. The shared
+            # camera_encoder was updated in-place by flow_opt.step() above, so
+            # the earlier `embs` graph is stale — re-running the encoder here
+            # produces a fresh graph whose backward pushes gradient into both
+            # the policies AND the shared encoder. (Wrapping it in no_grad
+            # would silently drop all encoder learning in this stage.
+            # No inplace crash occurs because this fresh graph is built after
+            # flow_opt.step() and nothing mutates the encoder after it.)
+            embs_v2 = encode_parsed(camera_encoder, parsed_o, device)
             with torch.no_grad():
                 o_joint_v2 = torch.cat(embs_v2, dim=-1)
                 a_joint_sample = sample_joint_flow(
@@ -511,9 +533,11 @@ def cmd_train(args):
                 joint_slices = split_per_agent(a_joint_sample, num_cameras, args.act_dim)
             for p in critics.parameters():
                 p.requires_grad_(False)
-            loss_distill = distillation_and_qmax_loss(
-                policies, critics, avg_mixer, embs_v2, joint_slices, alpha=args.alpha
+            loss_qmax, loss_distill_raw = distillation_and_qmax_loss(
+                policies, critics, avg_mixer, embs_v2, joint_slices
             )
+            # Fused Eq. 9 loss for the backward pass: -Q_tot + alpha * distill.
+            loss_distill = loss_qmax + args.alpha * loss_distill_raw
             policy_opt.zero_grad()
             loss_distill.backward()
             policy_opt.step()
@@ -525,6 +549,9 @@ def cmd_train(args):
             running["flow"] += loss_flow.item()
             running["critic"] += loss_critic.item()
             running["distill"] += loss_distill.item()
+            running["qmax"] += loss_qmax.item()
+            running["bc"] += loss_distill_raw.item()
+            running["adv_ess"] += adv_w_ess
 
         # ---- Logging / checkpointing ----
         step_1 = step + 1
@@ -534,7 +561,9 @@ def cmd_train(args):
                 f"step {step_1}/{args.steps} | ep {ep_count} | last_ep_rew {last_ep_reward:.3f}"
                 f" | last_ep_cov {last_ep_coverage:.3f}"
                 f" | flow {running['flow']/n:.4f} | critic {running['critic']/n:.4f}"
-                f" | distill {running['distill']/n:.4f} | buffer {len(replay)}",
+                f" | distill {running['distill']/n:.4f}"
+                f" | qmax {running['qmax']/n:.4f} | bc {running['bc']/n:.4f}"
+                f" | adv_ess {running['adv_ess']/n:.4f} | buffer {len(replay)}",
                 flush=True,
             )
             if wandb_run is not None:
@@ -545,23 +574,29 @@ def cmd_train(args):
                         "loss/flow": running["flow"] / n,
                         "loss/critic": running["critic"] / n,
                         "loss/distill": running["distill"] / n,
+                        "loss/qmax": running["qmax"] / n,
+                        "loss/bc": running["bc"] / n,
+                        "adv_weight_ess": running["adv_ess"] / n,
                         "buffer_size": len(replay),
                         "episodes": ep_count,
                     },
                     step=step_1,
                 )
-            running = {"flow": 0.0, "critic": 0.0, "distill": 0.0}
+            running = {"flow": 0.0, "critic": 0.0, "distill": 0.0,
+               "qmax": 0.0, "bc": 0.0, "adv_ess": 0.0}
 
         if step_1 % args.save_every == 0:
             save_checkpoint(
                 os.path.join(args.outdir, f"step_{step_1}.pt"),
                 models, optimizers, reward_norm, step_1, ep_count, config,
+                replay=replay, episode_stats=episode_stats,
             )
             print(f"  saved {os.path.join(args.outdir, 'step_' + str(step_1) + '.pt')}", flush=True)
 
     save_checkpoint(
         os.path.join(args.outdir, "final.pt"),
         models, optimizers, reward_norm, args.steps, ep_count, config,
+        replay=replay, episode_stats=episode_stats,
     )
     if wandb_run is not None:
         wandb_run.finish()

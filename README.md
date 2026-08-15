@@ -84,7 +84,7 @@ with TD, (3) one-step-policy distillation from the joint flow.
 
 ```bash
 # Train and save checkpoints every 1000 steps
-python train_flow.py train --steps 5000 --save-every 1000 --outdir ckpts
+python train_flow.py train --steps 10000000 
 
 # Train on GPU (MPS on Apple Silicon)
 python train_flow.py train --steps 5000 --device mps
@@ -156,3 +156,9 @@ report it separately from raw reward:
 - **train_flow.py (stdout + wandb):** `last_ep_cov` line, and a `coverage_rate`
   curve when `--wandb-api` is set.
 
+
+
+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
+
+
+python train.py --algo mappo --steps 10000000 

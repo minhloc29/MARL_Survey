@@ -1,9 +1,3 @@
-"""A simple uniform-sampling replay buffer for the flow-matching trainer.
-
-Stores raw numpy transitions and returns batched torch tensors on ``sample``.
-(No prioritization in the skeleton; see the plan for later deviations.)
-"""
-
 from __future__ import annotations
 
 import numpy as np
@@ -11,15 +5,6 @@ import torch
 
 
 class ReplayBuffer:
-    """Fixed-capacity ring buffer of transitions.
-
-    Each transition stores:
-        obs:       joint camera observation (num_cameras, obs_dim)
-        action:    normalized joint action (num_cameras, act_dim) in [-1, 1]
-        reward:    scalar
-        next_obs:  joint camera observation (num_cameras, obs_dim)
-        done:      bool
-    """
 
     def __init__(self, capacity: int):
         self.capacity = int(capacity)
@@ -67,12 +52,7 @@ class ReplayBuffer:
         self._size = min(self._size + 1, self.capacity)
 
     def sample(self, batch_size: int, device="cpu") -> dict[str, torch.Tensor]:
-        """Sample a batch of transitions as stacked torch tensors (float32).
-
-        Returns:
-            dict with keys obs, next_obs, action (all (B, C, ·)), reward (B,),
-            done (B,).
-        """
+      
         if self._size < batch_size:
             raise ValueError(
                 f"Not enough transitions ({self._size}) to sample {batch_size}."
@@ -87,3 +67,33 @@ class ReplayBuffer:
             ),
             "done": torch.as_tensor(self.done[idx], dtype=torch.float32, device=device),
         }
+
+    def to_dict(self) -> dict:
+        """Serialize the buffer (for checkpoint save). Returns None if empty."""
+        if self._size == 0:
+            return None
+        return {
+            "capacity": self.capacity,
+            "_pos": self._pos,
+            "_size": self._size,
+            "obs": self.obs,
+            "action": self.action,
+            "reward": self.reward,
+            "next_obs": self.next_obs,
+            "done": self.done,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "ReplayBuffer":
+
+        if d is None:
+            return cls(capacity=0)
+        rb = cls(capacity=d["capacity"])
+        rb._pos = d["_pos"]
+        rb._size = d["_size"]
+        rb.obs = d["obs"]
+        rb.action = d["action"]
+        rb.reward = d["reward"]
+        rb.next_obs = d["next_obs"]
+        rb.done = d["done"]
+        return rb

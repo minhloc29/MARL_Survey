@@ -1,18 +1,3 @@
-"""Network modules and losses for the MAC-Flow (flow-matching CTDE) algorithm.
-
-This mirrors the offline MAC-Flow recipe (Lee, Lee & Zhang, 2026) adapted to
-online CTDE training on MATE's cooperative camera team:
-
-  Stage 1  joint flow policy       v_phi(t, o_joint, x_t)  -- flow-matching BC
-  Stage 2  per-agent IGM critics   Q_theta_i(o_i, a_i)     + a mixer -> Q_tot
-  Stage 3  one-step policies       mu_w_i(o_i, z_i)        distilled from the flow
-
-Working-skeleton scope: three stage-1 encoders over the three MATE entity sets
-(targets / obstacles / teammates), uniform-sampling BC, and the IGM avg mixer.
-See the repo plan for the deviations (advantage-weighted BC, monotonic mixer,
-role conditioning) that are deliberately left for later.
-"""
-
 from __future__ import annotations
 
 import torch
@@ -20,11 +5,24 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-# --------------------------------------------------------------------------
-# 1. Entity / set encoder (permutation-invariant, no slot attention needed:
-#    MATE gives already-parsed entity vectors; we only need invariance over
-#    a variable-length visible-entity list, not object discovery).
-# --------------------------------------------------------------------------
+'''
+Camera i observes:
+
+Target 1: [x, y, velocity, ...]
+Target 2: [x, y, velocity, ...]
+Target 3: [x, y, velocity, ...]
+...
+
+Target 1 ─┐
+Target 2 ─┤
+Target 3 ─┤── EntitySetEncoder ──> [128-dimensional vector]
+Target 4 ─┘
+
+mask = torch.tensor([True, False, True, False])
+~mask = tensor([False, True, False, True])
+'''
+
+
 class EntitySetEncoder(nn.Module):
     """Permutation-invariant encoder for a variable-length list of entities.
 
@@ -46,10 +44,6 @@ class EntitySetEncoder(nn.Module):
         )
         self.pool_query = nn.Parameter(torch.randn(1, 1, embed_dim) * 0.02)
         self.pool_attn = nn.MultiheadAttention(embed_dim, n_heads, batch_first=True)
-        # Learnable null token appended to every set so the pooling attention
-        # always has at least one unmasked key. Without it, a camera sensing
-        # ZERO entities of a kind (all rows masked) feeds an all-padded key set
-        # into MultiheadAttention -> softmax over -inf -> NaN.
         self.null_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
 
     def forward(self, entities: torch.Tensor, valid_mask: torch.Tensor) -> torch.Tensor:
@@ -77,12 +71,6 @@ class EntitySetEncoder(nn.Module):
         return pooled.squeeze(1)
 
 
-# --------------------------------------------------------------------------
-# MATE -> per-agent obs encoder. A camera observes three entity sets in its
-# raw fixed-slot observation (targets, obstacles, teammates), each with its
-# own feature dim, plus its self state. We pool each set separately with its
-# own EntitySetEncoder and concatenate the results with the self embedding.
-# --------------------------------------------------------------------------
 class CameraObsEncoder(nn.Module):
     """Encode one camera's raw observation (self-state + 3 entity sets).
 
@@ -199,25 +187,7 @@ def advantage_weighted_flow_bc_loss(
     advantages: torch.Tensor,
     beta: float = 1.0,
 ) -> torch.Tensor:
-    """Advantage-weighted flow matching (AWR/IQL-style implicit improvement).
-
-    Instead of fitting the flow uniformly over the buffer (pure imitation),
-    weight each transition by ``exp(A(o,a) / beta)`` so the joint flow tracks
-    good joint actions in the buffer more than average ones. ``A`` is an
-    advantage estimate from the IGM critics (see train_flow.py).
-
-    Args:
-        velocity_field: the joint flow VelocityField.
-        o_joint: (B, joint_obs_dim) joint observation.
-        a_joint: (B, joint_act_dim) target joint action.
-        advantages: (B,) per-transition advantage estimates (not normalized
-            is fine; weights are softmax-stabilized below).
-        beta: advantage-temperature. Smaller beta upweights good transitions
-            more aggressively.
-
-    Returns:
-        Weighted flow-matching MSE (mean over batch).
-    """
+   
     x0 = torch.randn_like(a_joint)
     t = torch.rand(a_joint.size(0), 1, device=a_joint.device)
     x_t = (1 - t) * x0 + t * a_joint
@@ -225,11 +195,17 @@ def advantage_weighted_flow_bc_loss(
     pred_v = velocity_field(t, o_joint, x_t)
 
     per_sample = (pred_v - target_v).pow(2).mean(dim=-1)  # (B,)
-    # Numerically stable softmax weights over the batch.
-    logits = advantages.detach() / beta
-    weights = torch.softmax(logits - logits.max(), dim=0)  # (B,)
-    return (weights * per_sample).sum() / weights.sum()
 
+    adv = advantages.detach()
+    adv_std = adv.std().clamp_min(1e-6)
+    adv_normed = adv / adv_std
+    logits = adv_normed / beta
+    weights = torch.softmax(logits - logits.max(), dim=0)  # (B,)
+    wsum = weights.sum()
+    loss = (weights * per_sample).sum() / wsum
+
+    ess_norm = (wsum * wsum) / (weights.pow(2).sum() * weights.numel())
+    return loss, ess_norm.detach().item()
 
 # --------------------------------------------------------------------------
 # 3. Stage-2: per-agent IGM critics + mixer.
@@ -281,9 +257,7 @@ class MonotonicMixer(nn.Module):
         return q_tot.view(B)
 
 
-# --------------------------------------------------------------------------
-# 4. Stage-3: decentralized one-step policy (executes at deployment time).
-# --------------------------------------------------------------------------
+
 class OneStepPolicy(nn.Module):
     def __init__(self, obs_dim: int, noise_dim: int, act_dim: int, hidden: int = 256):
         super().__init__()
@@ -310,6 +284,34 @@ class OneStepPolicy(nn.Module):
 def split_per_agent(joint_action: torch.Tensor, n_agents: int, act_dim: int) -> list[torch.Tensor]:
     """Split a (B, n_agents*act_dim) joint action into per-agent (B, act_dim) slices."""
     return list(joint_action.view(joint_action.size(0), n_agents, act_dim).unbind(dim=1))
+
+
+# --------------------------------------------------------------------------
+# 5. Deterministic actor (used by MADDPG, not by the MAC-Flow pipeline).
+# --------------------------------------------------------------------------
+class DeterministicActor(nn.Module):
+    """Shared deterministic policy mu_i(o_i) -> tanh action (MADDPG).
+
+    Args:
+        obs_dim: per-camera observation embedding dim.
+        act_dim: per-camera continuous action dim.
+        hidden: hidden width.
+    """
+
+    def __init__(self, obs_dim: int, act_dim: int, hidden: int = 256):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(obs_dim, hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, act_dim),
+            nn.Tanh(),  # -> normalized [-1, 1] action
+        )
+
+    def forward(self, o_i: torch.Tensor) -> torch.Tensor:
+        """(B, obs_dim) -> (B, act_dim) in [-1, 1]."""
+        return self.net(o_i)
 
 
 def distillation_and_qmax_loss(
@@ -341,4 +343,5 @@ def distillation_and_qmax_loss(
         F.mse_loss(a_pred[i], joint_flow_target_slices[i])
         for i in range(len(a_pred))
     )
-    return -q_tot.mean() + alpha * distill
+   
+    return -q_tot.mean(), distill

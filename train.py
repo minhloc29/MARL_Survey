@@ -1,6 +1,7 @@
 import gymnasium as gym
 import gym_agent as ga
 import mate
+import numpy as np
 from agents import GreedyCameraAgent
 from mate.agents import GreedyTargetAgent
 from wrapper import NetWrapper, AgentAsActionWrapper
@@ -41,12 +42,75 @@ class Critic(nn.Module):
         value = self.linear(avg_features)
         return value
 
+
+# --------------------------------------------------------------------------
+# MAPPO networks: shared FeatureExtractor backbone + a decentralized goal
+# head (actor) and a centralized global-state value (critic).
+# --------------------------------------------------------------------------
+class MAPPOActor(nn.Module):
+    """Decentralized goal-mask actor head over the shared backbone features.
+
+    Input: (B, C, embed_dim) shared features. Output: (B, C, T) goal logits,
+    consumed by gym_agent's MultiBinary distribution.
+    """
+
+    def __init__(self, embed_dim: int = 64, num_targets: int = 8):
+        super().__init__()
+        self.head = nn.Linear(embed_dim, num_targets)
+
+    def forward(self, features: torch.Tensor):
+        return self.head(features)  # (B, C, T)
+
+
+class GlobalCritic(nn.Module):
+    """Centralized value: concatenate all camera features -> single scalar.
+
+    The value is shared for GAE over the whole cooperative team.
+    """
+
+    def __init__(self, embed_dim: int = 64, num_cameras: int = 4):
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(embed_dim * num_cameras, 256),
+            nn.ReLU(),
+            nn.Linear(256, 256),
+            nn.ReLU(),
+            nn.Linear(256, 1),
+        )
+
+    def forward(self, features: torch.Tensor):
+        B = features.size(0)
+        flat = features.reshape(B, -1)  # (B, C*D)
+        return self.mlp(flat).squeeze(-1)  # (B,)
+
+
 def make_actor_net():
     return Net()
 
 
 def make_critic_net():
     return Critic()
+
+
+def _mappo_feature_extractor(embed_dim=64, num_cameras=4):
+    """Shared backbone for MAPPO: FeatureExtractor -> (B, C, embed_dim)."""
+    return FeatureExtractor(
+        history_len=8,
+        camera_dim=8,
+        target_dim=3,
+        n_linear_attn_blocks=0,
+        n_attn_blocks=3,
+        embed_dim=embed_dim,
+        mha_config=MHAConfig(num_heads=1),
+    )
+
+
+def make_mappo_actor_net(embed_dim=64, num_targets=8):
+    return MAPPOActor(embed_dim=embed_dim, num_targets=num_targets)
+
+
+def make_mappo_critic_net(embed_dim=64, num_cameras=4):
+    return GlobalCritic(embed_dim=embed_dim, num_cameras=num_cameras)
 
 
 def make_env(**kwargs):
@@ -62,68 +126,35 @@ def make_env(**kwargs):
         reward_type="coverage_rate",
     )
 
+
+def make_maddpq_env(config_name: str = "MATE-4v8-9.yaml"):
+    """Raw continuous-action env for MADDPG (no goal-mask wrapper)."""
+    base_env = gym.make("MultiAgentTracking-v0", config=config_name)
+    return mate.MultiCamera.make(base_env, target_agent=GreedyTargetAgent())
+
+
+# MADDPG continuous camera action Box (per agency, 2-dim).
+_MADDPQ_ACTION_LOW = np.asarray([-5.0, -2.5], dtype=np.float64)
+_MADDPQ_ACTION_HIGH = np.asarray([5.0, 2.5], dtype=np.float64)
+
+
+def _denormalize_maddpq(a_norm: np.ndarray) -> np.ndarray:
+    """Map a normalized [-1,1] action to the MADDPG env Box."""
+    return _MADDPQ_ACTION_LOW + 0.5 * (
+        a_norm + 1.0
+    ) * (_MADDPQ_ACTION_HIGH - _MADDPQ_ACTION_LOW)
+
+
 from argparse import ArgumentParser
 
-def main():
-    parser = ArgumentParser()
-
-    parser.add_argument(
-        "--actor-lr",
-        type=float,
-        default=5e-5,
-        help="Learning rate for the agent's optimizer."
-    )
-
-    parser.add_argument(
-        "--critic-lr",
-        type=float,
-        default=1e-4,
-        help="Learning rate for the agent's optimizer."
-    )
-
-    parser.add_argument(
-        "--device",
-        type=str,
-        default="auto",
-        help="Device to run training on: 'auto', 'cuda', 'mps' (Apple Silicon), or 'cpu'."
-    )
+def add_common_args(parser):
+    parser.add_argument("--algo", choices=["ppo", "mappo", "maddpq"], default="mappo",
+                        help="Training algorithm to run.")
+    parser.add_argument("--device", type=str, default="cpu",
+                        help="Device to run training on: 'auto', 'cuda', 'mps' (Apple Silicon), or 'cpu'.")
 
 
-    parser.add_argument(
-        "--num-envs",
-        type=int,
-        default=16,
-        help="Number of parallel environments to use for training."
-    )
-    parser.add_argument(
-        "--n-steps",
-        type=int,
-        default=2048,
-        help="Number of steps to run in each environment per iteration."
-    )
-    parser.add_argument(
-        "--batch-size",
-        type=int,
-        default=128,
-        help="Batch size for training the agent."
-    )
-    parser.add_argument(
-        "--total-timesteps",
-        type=int,
-        default=10_000_000,
-        help="Total number of timesteps to train the agent."
-    )
-
-    parser.add_argument(
-        "--save-every",
-        type=int,
-        default=10_000,
-        help="Save the agent every N timesteps."
-    )
-
-
-    args = parser.parse_args()
-
+def run_ppo(args):
     agent = ga.PPO(
         env = make_env,
         policy=ActorCriticPolicy(
@@ -144,10 +175,272 @@ def main():
     agent.fit(
         total_timesteps=args.total_timesteps,
         save_every=args.save_every,
-        wandb_api="wandb_v1_UDhL4VvySJ8joPhdZKFgmNsCohZ"
-        # wandb_api="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"
+        wandb_api=args.wandb_api,
     )
+
+
+def run_mappo(args):
+    # MAPPO reuses gym_agent's on-policy PPO machinery (GAE + clipping), with
+    # the architecture reshaped to CTDE: a shared FeatureExtractor backbone,
+    # a decentralized goal-mask actor head, and a centralized global-state
+    # critic used for shared advantages.
+    num_cameras = 4
+    num_targets = 8
+    embed_dim = 64
+    agent = ga.PPO(
+        env = make_env,
+        policy=ActorCriticPolicy(
+            feature_extractor_func=lambda: _mappo_feature_extractor(
+                embed_dim=embed_dim, num_cameras=num_cameras
+            ),
+            actor_factory_func=lambda: make_mappo_actor_net(
+                embed_dim=embed_dim, num_targets=num_targets
+            ),
+            critic_factory_func=lambda: make_mappo_critic_net(
+                embed_dim=embed_dim, num_cameras=num_cameras
+            ),
+            actor_lr = args.actor_lr,
+            critic_lr = args.critic_lr
+        ),
+        config=ga.PPOConfig(
+            num_envs= args.num_envs,
+            n_steps=args.n_steps,
+            batch_size=args.batch_size,
+            device=args.device,
+            log_score_type='mean'
+        )
+    )
+
+    agent.fit(
+        total_timesteps=args.total_timesteps,
+        save_every=args.save_every,
+        wandb_api=args.wandb_api,
+    )
+
+
+def run_maddpq(args):
+    """Standalone MADDPG: deterministic actors + centralized critic, off-policy.
+
+    Uses the raw continuous camera action space (Box per camera), reusing
+    flow/'s encoders, replay buffer, and polyak-update pattern.
+    """
+    from flow import CameraObsEncoder, MateObserver, ReplayBuffer, DeterministicActor
+
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
+    device = torch.device(args.device)
+
+    env = make_maddpq_env()
+    num_cameras = env.unwrapped.num_cameras
+    num_targets = env.unwrapped.num_targets
+    num_obstacles = env.unwrapped.num_obstacles
+    obs_dim = np.asarray(env.reset()[0]).shape[-1]
+    act_dim = 2  # per-camera [dorientation, dviewing_angle]
+
+    embed_dim = args.embed_dim
+    entity_dims = {"targets": 5, "obstacles": 4, "teammates": 7}
+    camera_encoder = CameraObsEncoder(
+        self_state_dim=9, entity_dims=entity_dims, embed_dim=embed_dim
+    ).to(device)
+    obs_emb_dim = camera_encoder.out_dim
+    joint_act_dim = num_cameras * act_dim
+
+    actor = DeterministicActor(obs_emb_dim, act_dim).to(device)
+    target_actor = DeterministicActor(obs_emb_dim, act_dim).to(device)
+    target_actor.load_state_dict(actor.state_dict())
+
+    class CentralizedCritic(nn.Module):
+        def __init__(self, obs_emb_dim, joint_act_dim, hidden=256):
+            super().__init__()
+            self.net = nn.Sequential(
+                nn.Linear(obs_emb_dim * num_cameras + joint_act_dim, hidden),
+                nn.LayerNorm(hidden), nn.ReLU(),
+                nn.Linear(hidden, hidden), nn.ReLU(),
+                nn.Linear(hidden, 1),
+            )
+        def forward(self, obs_joint, joint_action):
+            return self.net(torch.cat([obs_joint, joint_action], dim=-1)).squeeze(-1)
+
+    critic = CentralizedCritic(obs_emb_dim, joint_act_dim).to(device)
+    target_critic = CentralizedCritic(obs_emb_dim, joint_act_dim).to(device)
+    target_critic.load_state_dict(critic.state_dict())
+
+    actor_opt = torch.optim.Adam(list(camera_encoder.parameters()) + list(actor.parameters()), lr=args.lr)
+    critic_opt = torch.optim.Adam(list(critic.parameters()), lr=args.lr)
+
+    replay = ReplayBuffer(args.replay_capacity)
+    observer = MateObserver(num_cameras, num_targets, num_obstacles)
+
+    def encode(joint_obs_np):
+        # joint_obs_np: (B, C, obs_dim) -> list of (B, obs_emb_dim)
+        B = joint_obs_np.shape[0]
+        parsed = [observer.parse(joint_obs_np[b]) for b in range(B)]
+        embs = []
+        for c in range(num_cameras):
+            ss = np.stack([parsed[b][c]["self_state"] for b in range(B)])
+            ents, msks = {}, {}
+            kinds = list(parsed[0][c]["entities"])
+            for k in kinds:
+                ents[k] = np.stack([parsed[b][c]["entities"][k][0] for b in range(B)])
+                msks[k] = np.stack([parsed[b][c]["entities"][k][1] for b in range(B)])
+            embs.append(camera_encoder(
+                torch.as_tensor(ss, dtype=torch.float32, device=device),
+                {k: torch.as_tensor(v, dtype=torch.float32, device=device) for k, v in ents.items()},
+                {k: torch.as_tensor(v, dtype=torch.bool, device=device) for k, v in msks.items()},
+            ))
+        return torch.cat(embs, dim=-1)  # (B, C*obs_emb_dim)
+
+    # ---- Collect loop ----
+    obs, _ = env.reset()
+    episode_reward = 0.0
+    episode_len = 0
+    last_ep_reward = 0.0
+    episode_coverage = 0.0
+    last_ep_coverage = 0.0
+
+    for step in range(args.steps):
+        obs_np = np.asarray(obs, dtype=np.float64)[None]  # (1, C, obs_dim)
+        with torch.no_grad():
+            o_joint = encode(obs_np)                       # (1, C*D)
+            per_cam = [o_joint.view(1, num_cameras, -1)[0, c] for c in range(num_cameras)]  # list of (D,)
+            a_norm = torch.stack([actor(o.unsqueeze(0)) for o in per_cam], dim=0).squeeze(1)  # (C, act_dim)
+            a_norm = a_norm.cpu().numpy()
+        # Exploration noise
+        a_norm = a_norm + np.random.normal(0, args.noise_scale, size=a_norm.shape)
+        a_norm = np.clip(a_norm, -1, 1)
+        a_env = _denormalize_maddpq(a_norm)
+
+        obs2, reward, done, truncated, info = env.step(a_env)
+        replay.add(obs_np[0], a_norm, reward, np.asarray(obs2, dtype=np.float64), done or truncated)
+
+        cam_infos = info.get("infos") if isinstance(info, dict) else None
+        step_coverage = float(np.mean([c.get("coverage_rate", 0.0) for c in cam_infos])) if cam_infos else 0.0
+
+        episode_reward += float(reward)
+        episode_coverage += step_coverage
+        episode_len += 1
+        obs = obs2
+        if done or truncated:
+            last_ep_reward = episode_reward
+            last_ep_coverage = episode_coverage / max(1, episode_len)
+            episode_reward = 0.0
+            episode_coverage = 0.0
+            episode_len = 0
+            obs, _ = env.reset()
+
+        # ---- Update ----
+        if len(replay) >= args.warmup:
+            batch = replay.sample(args.batch_size, device=device)
+            o_np = batch["obs"].cpu().numpy()
+            no_np = batch["next_obs"].cpu().numpy()
+
+            o_joint = encode(o_np)          # (B, C*D)
+            no_joint = encode(no_np)
+            a_joint = batch["action"].reshape(batch["action"].size(0), -1)  # (B, C*2)
+
+            with torch.no_grad():
+                # target next actions
+                per_cam_no = [no_joint.view(no_joint.size(0), num_cameras, -1)[:, c] for c in range(num_cameras)]
+                a_next = torch.cat([target_actor(o) for o in per_cam_no], dim=-1)
+                q_next = target_critic(no_joint, a_next)
+                target = batch["reward"] + args.gamma * (1.0 - batch["done"]) * q_next
+
+            q = critic(o_joint, a_joint)
+            loss_critic = nn.functional.mse_loss(q, target)
+
+            # Actor loss first: maximize Q(o, [mu_1..mu_C]) through the CURRENT
+            # critic weights + shared encoder.
+            per_cam = [o_joint.view(o_joint.size(0), num_cameras, -1)[:, c] for c in range(num_cameras)]
+            joint_mu = torch.cat([actor(o) for o in per_cam], dim=-1)
+            loss_actor = -critic(o_joint, joint_mu).mean()
+
+            # Actor before critic keeps the critic untouched while its graph is
+            # alive. But actor_opt shares the camera_encoder: its step mutates
+            # the encoder in-place, so the earlier `o_joint`/`loss_critic` graph
+            # becomes stale. Re-encode freshly for the critic loss to build a
+            # valid backward graph.
+            actor_opt.zero_grad()
+            loss_actor.backward()
+            actor_opt.step()
+
+            o_joint2 = encode(o_np)
+            a_joint2 = batch["action"].reshape(batch["action"].size(0), -1)
+            q2 = critic(o_joint2, a_joint2)
+            loss_critic = nn.functional.mse_loss(q2, target)
+
+            critic_opt.zero_grad()
+            loss_critic.backward()
+            critic_opt.step()
+
+            # polyak
+            for t, s in zip(target_actor.parameters(), actor.parameters()):
+                t.data.copy_(args.tau * s.data + (1 - args.tau) * t.data)
+            for t, s in zip(target_critic.parameters(), critic.parameters()):
+                t.data.copy_(args.tau * s.data + (1 - args.tau) * t.data)
+
+            if args.wandb_api:
+                import wandb
+                
+                wandb.init(
+                    project="mate-maddpq",
+                    name="maddpq-run",
+                    config={
+                        "algorithm": "MADDPQ",
+                        # "lr": lr,
+                        # "batch_size": batch_size,
+                    },
+                )
+                
+                wandb.log({"maddpq/critic_loss": loss_critic.item(),
+                           "maddpq/actor_loss": loss_actor.item()})
+
+        if (step + 1) % args.log_every == 0:
+            print(f"step {step+1}/{args.steps} | last_ep_rew {last_ep_reward:.3f} "
+                  f"| last_ep_cov {last_ep_coverage:.3f} | buffer {len(replay)}", flush=True)
+
+
+def main():
+    parser = ArgumentParser()
+    add_common_args(parser)
+
+    parser.add_argument("--actor-lr", type=float, default=5e-5,
+                        help="Learning rate for the agent's actor/optimizer.")
+    parser.add_argument("--critic-lr", type=float, default=1e-4,
+                        help="Learning rate for the agent's critic/optimizer.")
+
+    parser.add_argument("--num-envs", type=int, default=16,
+                        help="Number of parallel environments to use for training.")
+    parser.add_argument("--n-steps", type=int, default=2048,
+                        help="Number of steps to run in each environment per iteration.")
+    parser.add_argument("--batch-size", type=int, default=128,
+                        help="Batch size for training the agent.")
+    parser.add_argument("--total-timesteps", type=int, default=10_000_000,
+                        help="Total number of timesteps to train the agent.")
+    parser.add_argument("--save-every", type=int, default=10_000,
+                        help="Save the agent every N timesteps.")
+
+    # MADDPG-specific
+    parser.add_argument("--embed-dim", type=int, default=128)
+    parser.add_argument("--lr", type=float, default=3e-4)
+    parser.add_argument("--replay-capacity", type=int, default=100_000)
+    parser.add_argument("--warmup", type=int, default=1000)
+    parser.add_argument("--gamma", type=float, default=0.99)
+    parser.add_argument("--tau", type=float, default=0.005)
+    parser.add_argument("--noise-scale", type=float, default=0.1)
+    parser.add_argument("--steps", type=int, default=50_000)
+    parser.add_argument("--log-every", type=int, default=200)
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--wandb-api", default="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")
+
+    args = parser.parse_args()
+
+    dispatcher = {
+        "ppo": run_ppo,
+        "mappo": run_mappo,
+        "maddpq": run_maddpq,
+    }
+    dispatcher[args.algo](args)
+
 
 if __name__ == "__main__":
     main()
-
