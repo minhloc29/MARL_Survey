@@ -279,7 +279,10 @@ def add_train_args(parser):
     parser.add_argument("--wandb-api", default="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",
                         help="If set, log training curves to Weights & Biases (a wandb API key).")
     parser.add_argument("--seed", type=int, default=0)
-
+    parser.add_argument("--num-workers", type=int, default=os.cpu_count(),
+                    help="CPU threads this process may use (torch intra-op "
+                         "parallelism). Set explicitly when running several "
+                         "training processes concurrently on one machine.")
 
 def parse_arguments(argv=None):
     parser = argparse.ArgumentParser(
@@ -312,6 +315,8 @@ def parse_arguments(argv=None):
 # Subcommands.
 # --------------------------------------------------------------------------
 def cmd_train(args):
+    torch.set_num_threads(args.num_workers)
+    torch.set_num_interop_threads(max(1, args.num_workers // 2))
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
     if torch.cuda.is_available():
