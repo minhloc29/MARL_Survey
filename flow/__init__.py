@@ -17,6 +17,7 @@ from .nets import (
 )
 from .observers import MateObserver
 from .replay import ReplayBuffer
+from .vd import AgentQNetwork, QplexMixer, encode_joint
 
 __all__ = [
     "CameraObsEncoder",
@@ -34,4 +35,7 @@ __all__ = [
     "split_per_agent",
     "MateObserver",
     "ReplayBuffer",
+    "AgentQNetwork",
+    "QplexMixer",
+    "encode_joint",
 ]

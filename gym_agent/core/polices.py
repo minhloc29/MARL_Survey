@@ -274,14 +274,16 @@ class TargetActorCriticPolicy(ActorCriticPolicy):
 
         self.hard_update()  # Initialize target network weights to match the main network
 
-        self.target_feature_extractor.eval()  # Set the target network to evaluation mode
+        if self.target_feature_extractor is not None:
+            self.target_feature_extractor.eval()  # Set the target network to evaluation mode
         self.target_actor.eval()  # Set the target network to evaluation mode
         self.target_critic.eval()  # Set the target network to evaluation mode
 
     def train(self, mode: bool = True) -> 'Self':
         # Override to keep target networks in eval mode
         super().train(mode)
-        self.target_feature_extractor.eval()
+        if self.target_feature_extractor is not None:
+            self.target_feature_extractor.eval()
         self.target_actor.eval()
         self.target_critic.eval()
         return self
@@ -322,7 +324,7 @@ class TargetActorCriticPolicy(ActorCriticPolicy):
             self.target_critic.parameters(), self.critic.parameters()
         ):
             target_param.data.copy_(
-                tau_actor * local_param.data + (1.0 - tau_actor) * target_param.data
+                tau_critic * local_param.data + (1.0 - tau_critic) * target_param.data
             )
 
         if self.target_feature_extractor is not None:

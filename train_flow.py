@@ -50,7 +50,7 @@ class RunningMeanStd:
     def __init__(self, eps: float = 1e-4):
         self.n = 0
         self.mean = 0.0
-        self.M2 = 0.0
+        self.M2 = 0.    
         self.eps = eps
 
     def update(self, values: np.ndarray) -> None:
@@ -276,8 +276,8 @@ def add_train_args(parser):
     parser.add_argument("--outdir", default="ckpts")
     parser.add_argument("--resume", default=None,
                         help="Path to a checkpoint to resume training from.")
-    parser.add_argument("--wandb-api", default="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",
-                        help="If set, log training curves to Weights & Biases (a wandb API key).")
+    parser.add_argument("--wandb-api", default=None,
+                        help="W&B API key (or set $WANDB_API_KEY). If not set, no W&B logging.")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--num-workers", type=int, default=os.cpu_count(),
                     help="CPU threads this process may use (torch intra-op "
@@ -674,6 +674,8 @@ def cmd_render(args):
 
 def main(argv=None):
     args = parse_arguments(argv)
+    if args.wandb_api is None:
+        args.wandb_api = os.environ.get("WANDB_API_KEY")
     args.func(args)
 
 

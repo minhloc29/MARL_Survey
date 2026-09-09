@@ -2,6 +2,9 @@
 
 
 from mate import agents, constants, environment, utils, wrappers
+from mate.algorithms.coma import COMAConfig, COMATrainer, run_coma
+from mate.algorithms.mat import MATConfig, MATPolicy, MATTrainer, run_mat
+from mate.algorithms.rode import MateRodeEnv, make_mate_rode_env
 from mate.agents import (
     GreedyCameraAgent,
     GreedyTargetAgent,
@@ -36,6 +39,15 @@ __all__ = [
     "RandomTargetAgent",
     "HeuristicCameraAgent",
     "HeuristicTargetAgent",
+    "COMAConfig",
+    "COMATrainer",
+    "run_coma",
+    "MATConfig",
+    "MATPolicy",
+    "MATTrainer",
+    "run_mat",
+    "MateRodeEnv",
+    "make_mate_rode_env",
 
     "group_reset",
     "group_step",
@@ -68,6 +80,7 @@ def make_environment(config=None, wrappers=(), **kwargs):  # pylint: disable=red
         env = wrapper(env)
 
     return env
+
 
 def auto_register(id, **kwargs):
     import gymnasium as gym  # Ensure gym is defined in this scope
@@ -131,4 +144,3 @@ auto_register(
     id="MATE-Navigation-v0",
     kwargs={"config": (ASSETS_DIR / "MATE-Navigation.yaml")},
 )
-
