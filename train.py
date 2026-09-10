@@ -168,7 +168,7 @@ def _denormalize_maddpq(a_norm: np.ndarray) -> np.ndarray:
 
 
 def add_common_args(parser):
-    parser.add_argument("--algo", choices=["ppo", "mappo", "maddpq", "qmix", "qplex", "rode", "coma", "mat", "dcg"], default="mappo",
+    parser.add_argument("--algo", choices=["ppo", "mappo", "maddpq", "qmix", "qplex", "rode", "coma", "mat", "dcg", "i2c"], default="mappo",
                         help="Training algorithm to run.")
     parser.add_argument("--device", type=str, default="cpu",
                         help="Device to run training on: 'auto', 'cuda', 'mps' (Apple Silicon), or 'cpu'.")
@@ -736,6 +736,20 @@ def main():
     parser.add_argument("--dcg-msg-iterations", type=int, default=8)
     parser.add_argument("--dcg-lr", type=float, default=5e-4)
     parser.add_argument("--dcg-outdir", default="ckpts/dcg")
+    parser.add_argument("--i2c-config", default="MATE-4v8-9.yaml")
+    parser.add_argument("--i2c-levels", type=int, default=3)
+    parser.add_argument("--i2c-episode-limit", type=int, default=64)
+    parser.add_argument("--i2c-episodes", type=int, default=1000)
+    parser.add_argument("--i2c-update-every", type=int, default=8)
+    parser.add_argument("--i2c-batch-size", type=int, default=32)
+    parser.add_argument("--i2c-hidden", type=int, default=128)
+    parser.add_argument("--i2c-msg-dim", type=int, default=64)
+    parser.add_argument("--i2c-tau", type=float, default=1.0)
+    parser.add_argument("--i2c-blz-coef", type=float, default=0.01)
+    parser.add_argument("--i2c-epsilon", type=float, default=0.05)
+    parser.add_argument("--i2c-actor-lr", type=float, default=1e-4)
+    parser.add_argument("--i2c-critic-lr", type=float, default=1e-3)
+    parser.add_argument("--i2c-outdir", default="ckpts/i2c")
 
     args = parser.parse_args()
     if args.wandb_api is None:
@@ -752,10 +766,12 @@ def main():
     from mate.algorithms.coma import run_coma
     from mate.algorithms.mat import run_mat
     from mate.algorithms.dcg import run_dcg
+    from mate.algorithms.i2c import run_i2c
     dispatcher["rode"] = run_rode
     dispatcher["coma"] = run_coma
     dispatcher["mat"] = run_mat
     dispatcher["dcg"] = run_dcg
+    dispatcher["i2c"] = run_i2c
     dispatcher[args.algo](args)
 
 

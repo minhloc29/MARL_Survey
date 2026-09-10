@@ -4,6 +4,7 @@
 from mate import agents, constants, environment, utils, wrappers
 from mate.algorithms.coma import COMAConfig, COMATrainer, run_coma
 from mate.algorithms.dcg import DCGConfig, DCGNetwork, DCGTrainer, run_dcg
+from mate.algorithms.i2c import I2CConfig, I2CCritic, I2CPolicy, I2CTrainer, run_i2c
 from mate.algorithms.mat import MATConfig, MATPolicy, MATTrainer, run_mat
 from mate.algorithms.rode import MateRodeEnv, make_mate_rode_env
 from mate.agents import (
@@ -47,6 +48,11 @@ __all__ = [
     "DCGNetwork",
     "DCGTrainer",
     "run_dcg",
+    "I2CConfig",
+    "I2CCritic",
+    "I2CPolicy",
+    "I2CTrainer",
+    "run_i2c",
     "MATConfig",
     "MATPolicy",
     "MATTrainer",
