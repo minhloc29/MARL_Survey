@@ -3,6 +3,7 @@
 
 from mate import agents, constants, environment, utils, wrappers
 from mate.algorithms.coma import COMAConfig, COMATrainer, run_coma
+from mate.algorithms.dcg import DCGConfig, DCGNetwork, DCGTrainer, run_dcg
 from mate.algorithms.mat import MATConfig, MATPolicy, MATTrainer, run_mat
 from mate.algorithms.rode import MateRodeEnv, make_mate_rode_env
 from mate.agents import (
@@ -42,6 +43,10 @@ __all__ = [
     "COMAConfig",
     "COMATrainer",
     "run_coma",
+    "DCGConfig",
+    "DCGNetwork",
+    "DCGTrainer",
+    "run_dcg",
     "MATConfig",
     "MATPolicy",
     "MATTrainer",

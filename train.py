@@ -168,7 +168,7 @@ def _denormalize_maddpq(a_norm: np.ndarray) -> np.ndarray:
 
 
 def add_common_args(parser):
-    parser.add_argument("--algo", choices=["ppo", "mappo", "maddpq", "qmix", "qplex", "rode", "coma", "mat"], default="mappo",
+    parser.add_argument("--algo", choices=["ppo", "mappo", "maddpq", "qmix", "qplex", "rode", "coma", "mat", "dcg"], default="mappo",
                         help="Training algorithm to run.")
     parser.add_argument("--device", type=str, default="cpu",
                         help="Device to run training on: 'auto', 'cuda', 'mps' (Apple Silicon), or 'cpu'.")
@@ -723,6 +723,19 @@ def main():
     parser.add_argument("--mat-n-heads", type=int, default=4)
     parser.add_argument("--mat-n-layers", type=int, default=2)
     parser.add_argument("--mat-outdir", default="ckpts/mat")
+    parser.add_argument("--dcg-config", default="MATE-4v8-9.yaml")
+    parser.add_argument("--dcg-levels", type=int, default=3)
+    parser.add_argument("--dcg-episode-limit", type=int, default=64)
+    parser.add_argument("--dcg-episodes", type=int, default=1000)
+    parser.add_argument("--dcg-update-every", type=int, default=8)
+    parser.add_argument("--dcg-batch-size", type=int, default=8)
+    parser.add_argument("--dcg-hidden", type=int, default=64)
+    parser.add_argument("--dcg-cg-edges", default="full")
+    parser.add_argument("--dcg-payoff-rank", type=int, default=0)
+    parser.add_argument("--dcg-duelling", action="store_true")
+    parser.add_argument("--dcg-msg-iterations", type=int, default=8)
+    parser.add_argument("--dcg-lr", type=float, default=5e-4)
+    parser.add_argument("--dcg-outdir", default="ckpts/dcg")
 
     args = parser.parse_args()
     if args.wandb_api is None:
@@ -738,9 +751,11 @@ def main():
     from mate.algorithms.rode import run_rode
     from mate.algorithms.coma import run_coma
     from mate.algorithms.mat import run_mat
+    from mate.algorithms.dcg import run_dcg
     dispatcher["rode"] = run_rode
     dispatcher["coma"] = run_coma
     dispatcher["mat"] = run_mat
+    dispatcher["dcg"] = run_dcg
     dispatcher[args.algo](args)
 
 
