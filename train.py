@@ -168,7 +168,7 @@ def _denormalize_maddpq(a_norm: np.ndarray) -> np.ndarray:
 
 
 def add_common_args(parser):
-    parser.add_argument("--algo", choices=["ppo", "mappo", "maddpq", "qmix", "qplex", "rode", "coma", "mat", "dcg", "i2c"], default="mappo",
+    parser.add_argument("--algo", choices=["ppo", "mappo", "maddpq", "qmix", "qplex", "rode", "coma", "mat", "dcg", "i2c", "mamba", "aorpo", "mambpo"], default="mappo",
                         help="Training algorithm to run.")
     parser.add_argument("--device", type=str, default="cpu",
                         help="Device to run training on: 'auto', 'cuda', 'mps' (Apple Silicon), or 'cpu'.")
@@ -656,6 +656,12 @@ def run_qplex(args):
 def main():
     parser = ArgumentParser()
     add_common_args(parser)
+    from mate.algorithms.mamba import add_mamba_args, run_mamba
+    add_mamba_args(parser)
+    from mate.algorithms.aorpo import add_aorpo_args, run_aorpo
+    add_aorpo_args(parser)
+    from mate.algorithms.mambpo import add_mambpo_args, run_mambpo
+    add_mambpo_args(parser)
 
     parser.add_argument("--actor-lr", type=float, default=5e-5,
                         help="Learning rate for the agent's actor/optimizer.")
@@ -761,6 +767,9 @@ def main():
         "maddpq": run_maddpq,
         "qmix": run_qmix,
         "qplex": run_qplex,
+        "mamba": run_mamba,
+        "aorpo": run_aorpo,
+        "mambpo": run_mambpo,
     }
     from mate.algorithms.rode import run_rode
     from mate.algorithms.coma import run_coma

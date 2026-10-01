@@ -1,5 +1,17 @@
 # MATE
 
+MAMBA is available via `python train.py --algo mamba --device auto`.
+See [MAMBA integration](mate/algorithms/mamba/README.md) for training, checkpoint
+resumption, evaluation and smoke-test commands.
+
+AORPO is available via `python train.py --algo aorpo --device auto`.
+See [AORPO integration](mate/algorithms/aorpo/README.md) for adaptive opponent-wise
+rollouts, training, checkpoint resumption and evaluation.
+
+MAMBPO is available via `python train.py --algo mambpo --device auto`.
+See [MAMBPO integration](mate/algorithms/mambpo/README.md) for continuous camera
+control, decentralized actors, shared world-model training and evaluation.
+
 Multi-Agent Tracking Environment. Two training pipelines are provided: a PPO
 goal-mask trainer ([train.py](train.py)) and a standalone MAC-Flow
 (flow-matching CTDE) trainer ([train_flow.py](train_flow.py)).

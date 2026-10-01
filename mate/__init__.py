@@ -7,6 +7,9 @@ from mate.algorithms.dcg import DCGConfig, DCGNetwork, DCGTrainer, run_dcg
 from mate.algorithms.i2c import I2CConfig, I2CCritic, I2CPolicy, I2CTrainer, run_i2c
 from mate.algorithms.mat import MATConfig, MATPolicy, MATTrainer, run_mat
 from mate.algorithms.rode import MateRodeEnv, make_mate_rode_env
+from mate.algorithms.mamba import MAMBAConfig, MAMBATrainer, run_mamba
+from mate.algorithms.aorpo import AORPOConfig, AORPOTrainer, run_aorpo
+from mate.algorithms.mambpo import MAMBPOConfig, MAMBPOTrainer, run_mambpo
 from mate.agents import (
     GreedyCameraAgent,
     GreedyTargetAgent,
@@ -59,6 +62,15 @@ __all__ = [
     "run_mat",
     "MateRodeEnv",
     "make_mate_rode_env",
+    "MAMBAConfig",
+    "MAMBATrainer",
+    "run_mamba",
+    "AORPOConfig",
+    "AORPOTrainer",
+    "run_aorpo",
+    "MAMBPOConfig",
+    "MAMBPOTrainer",
+    "run_mambpo",
 
     "group_reset",
     "group_step",
