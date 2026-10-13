@@ -34,6 +34,7 @@ from torch.distributions import Categorical
 
 from mate.algorithms.rode.environment import make_mate_rode_env
 from mate.algorithms.rode.replay import RODEEpisodeBuilder, RODEEpisodeReplay
+from mate.algorithms._wandb import WandbLogger
 
 
 # ============================================================================
@@ -145,6 +146,7 @@ class FACMACConfig:
     # io
     save_every: int = 1000
     outdir: str = "ckpts/facmac"
+    wandb_api: Optional[str] = None
 
 
 class FACMACTrainer:
@@ -172,6 +174,7 @@ class FACMACTrainer:
         self.epsilon = config.epsilon_start
         self._env_steps = 0
         self._critic_steps = 0
+        self.wandb = WandbLogger("mate-facmac", "facmac", dict(config.__dict__), config.wandb_api)
 
     # ------------------------------------------------------- exploration
     def _schedule_epsilon(self) -> None:
@@ -306,6 +309,8 @@ class FACMACTrainer:
                     print(f"[facmac] ep={ep} rew={total:.2f} "
                           f"critic_loss={cl:.3f} pg_loss={pl:.4f} "
                           f"eps={self.epsilon:.2f}")
+                    self.wandb.log({"reward": total, "critic_loss": cl,
+                                    "pg_loss": pl, "epsilon": self.epsilon}, step=ep)
             if ep % cfg.save_every == 0:
                 self.save()
 
@@ -320,6 +325,7 @@ class FACMACTrainer:
         self.critic.load_state_dict(torch.load(out / "critic.th", weights_only=True))
 
     def close(self) -> None:
+        self.wandb.finish()
         self.env.close()
 
     def evaluate(self, n_episodes: int = 10) -> float:

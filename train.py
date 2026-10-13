@@ -559,6 +559,14 @@ def run_vd(args, mixer_kind):
     last_ep_reward = 0.0
 
     hard_update()  # sync targets at start
+
+    wandb_run = None
+    if args.wandb_api:
+        import wandb
+        wandb.login(key=args.wandb_api)
+        wandb_run = wandb.init(project=f"mate-{mixer_kind}", name=mixer_kind,
+                               config=vars(args), reinit=True)
+
     for step in range(1, args.steps + 1):
         eps = max(args.eps_end, args.eps_start
                   - (step - 1) * (args.eps_start - args.eps_end) / args.eps_decay)
@@ -686,6 +694,7 @@ def run_dm2(args):
         clip_param=args.dm2_clip_param, lr=args.dm2_lr,
         gamma=args.dm2_gamma, gae_lambda=args.dm2_gae_lambda,
         device=args.device, seed=args.seed, outdir=args.dm2_outdir,
+        wandb_api=args.wandb_api,
     )
     DM2Trainer(cfg).train()
 
@@ -704,6 +713,7 @@ def run_facmac(args):
         target_update_interval=args.facmac_target_update_interval,
         epsilon_start=args.facmac_epsilon_start, epsilon_finish=args.facmac_epsilon_finish,
         device=args.device, seed=args.seed, outdir=args.facmac_outdir,
+        wandb_api=args.wandb_api,
     )
     FACMACTrainer(cfg).train()
 

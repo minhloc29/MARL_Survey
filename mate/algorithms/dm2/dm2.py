@@ -33,6 +33,7 @@ import torch.nn.functional as F
 from torch.distributions import Categorical
 
 from mate.algorithms.rode.environment import make_mate_rode_env
+from mate.algorithms._wandb import WandbLogger
 
 
 # ============================================================================
@@ -318,6 +319,7 @@ class DM2Config:
     train_after: int = 16              # episodes collected before first update
     save_every: int = 100
     outdir: str = "ckpts/dm2"
+    wandb_api: Optional[str] = None
 
 
 class DM2Trainer:
@@ -361,6 +363,7 @@ class DM2Trainer:
         # on-policy buffer: accumulates episodes until a PPO update
         self._episodes: list[dict[str, np.ndarray]] = []
         self._env_steps = 0
+        self.wandb = WandbLogger("mate-dm2", "dm2", dict(config.__dict__), config.wandb_api)
 
     # ------------------------------------------------------------ data
     def collect_episode(self, seed: int) -> float:
@@ -525,6 +528,7 @@ class DM2Trainer:
             self._episodes.clear()
             print(f"[dm2] ep={ep} rew={rt:.2f}",
                   {k: round(v, 4) for k, v in info.items()})
+            self.wandb.log({"reward": rt, **info}, step=ep)
             if ep % cfg.save_every == 0:
                 self.save()
 
@@ -543,6 +547,7 @@ class DM2Trainer:
             d.load(out, i)
 
     def close(self) -> None:
+        self.wandb.finish()
         self.env.close()
 
 

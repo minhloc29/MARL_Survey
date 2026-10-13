@@ -5,7 +5,7 @@ from __future__ import annotations
 import copy
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 import numpy as np
 import torch
@@ -14,6 +14,7 @@ from torch.distributions import Categorical
 
 from mate.algorithms.rode.environment import make_mate_rode_env
 from mate.algorithms.rode.replay import RODEEpisodeBuilder, RODEEpisodeReplay
+from mate.algorithms._wandb import WandbLogger
 
 
 class COMAActor(nn.Module):
@@ -91,6 +92,7 @@ class COMAConfig:
     device: str = "cpu"
     seed: int = 0
     outdir: str = "ckpts/coma"
+    wandb_api: Optional[str] = None
 
 
 class COMATrainer:
@@ -119,6 +121,7 @@ class COMATrainer:
         self.critic_optimizer = torch.optim.Adam(
             self.critic.parameters(), lr=config.critic_lr)
         self.replay = RODEEpisodeReplay(config.replay_capacity, self.device)
+        self.wandb = WandbLogger("mate-coma", "coma", dict(config.__dict__), config.wandb_api)
 
     def collect_episode(self, episode_index: int):
         obs, state = self.env.reset(seed=self.config.seed + episode_index)
@@ -200,13 +203,19 @@ class COMATrainer:
                 last_losses = self.update(
                     self.replay.sample(self.config.batch_size))
             if (episode_index + 1) % 10 == 0:
+                actor_l, critic_l = last_losses
                 print(
-                    f"episode {episode_index + 1}/{self.config.episodes} | reward {reward:.3f} | actor {last_losses[0]} | critic {last_losses[1]}", flush=True)
+                    f"episode {episode_index + 1}/{self.config.episodes} | reward {reward:.3f} | actor {actor_l} | critic {critic_l}", flush=True)
+                self.wandb.log({"reward": reward,
+                                "actor_loss": actor_l if actor_l is not None else float("nan"),
+                                "critic_loss": critic_l if critic_l is not None else float("nan")},
+                               step=episode_index + 1)
             if (episode_index + 1) % self.config.target_update_every == 0:
                 self.target_critic.load_state_dict(self.critic.state_dict())
         Path(self.config.outdir).mkdir(parents=True, exist_ok=True)
         torch.save({"actor": self.actor.state_dict(
         ), "critic": self.critic.state_dict()}, Path(self.config.outdir) / "latest.pt")
+        self.wandb.finish()
         self.env.close()
 
 
@@ -221,4 +230,5 @@ def run_coma(args: Any) -> None:
         device=args.device,
         seed=args.seed,
         outdir=args.coma_outdir,
+        wandb_api=args.wandb_api,
     )).train()

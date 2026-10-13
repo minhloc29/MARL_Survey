@@ -43,6 +43,7 @@ from torch.distributions import Categorical
 
 from mate.algorithms.rode.environment import make_mate_rode_env
 from mate.algorithms.rode.replay import RODEEpisodeBuilder, RODEEpisodeReplay
+from mate.algorithms._wandb import WandbLogger
 
 
 def _mlp(input_dim: int, hidden: int, output: int, n_layers: int = 2) -> nn.Sequential:
@@ -203,6 +204,7 @@ class I2CConfig:
     device: str = "cpu"
     seed: int = 0
     outdir: str = "ckpts/i2c"
+    wandb_api: Optional[str] = None
 
 
 class I2CTrainer:
@@ -232,6 +234,7 @@ class I2CTrainer:
         self.actor_optimizer = torch.optim.Adam(self.actor.parameters(), lr=config.actor_lr)
         self.critic_optimizer = torch.optim.Adam(self.critic.parameters(), lr=config.critic_lr)
         self.replay = RODEEpisodeReplay(config.replay_capacity, self.device)
+        self.wandb = WandbLogger("mate-i2c", "i2c", dict(config.__dict__), config.wandb_api)
 
     # ------------------------------------------------------------ collection
 
@@ -384,10 +387,16 @@ class I2CTrainer:
                 if last[0] is not None:
                     msg += (f" | actor {last[0]:.4f} | critic {last[1]:.4f} | blz {last[2]:.4f}")
                 print(msg, flush=True)
+                self.wandb.log({"reward": reward,
+                                "actor_loss": last[0] if last[0] is not None else float("nan"),
+                                "critic_loss": last[1] if last[1] is not None else float("nan"),
+                                "blz": last[2] if last[2] is not None else float("nan")},
+                               step=episode_index + 1)
         outdir = Path(cfg.outdir)
         outdir.mkdir(parents=True, exist_ok=True)
         torch.save({"actor": self.actor.state_dict(), "critic": self.critic.state_dict(),
                     "config": cfg.__dict__}, outdir / "latest.pt")
+        self.wandb.finish()
         self.env.close()
 
 
@@ -410,4 +419,5 @@ def run_i2c(args: Any) -> None:
         device=args.device,
         seed=args.seed,
         outdir=args.i2c_outdir,
+        wandb_api=args.wandb_api,
     )).train()

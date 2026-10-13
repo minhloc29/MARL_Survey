@@ -43,6 +43,10 @@ python train.py --algo mappo --device auto   # cuda, mps (Apple Silicon), or cpu
 For per-algorithm options (learning rates, epsilon, batch size, target-update
 cadence, etc.) run `python train.py --help` or see the `--<algo>-*` flags.
 
+Every algorithm logs rewards and losses to **W&B** when an API key is provided
+(`--wandb-api <key>`, or the `WANDB_API_KEY` env var), one run per algorithm;
+training still runs normally without one.
+
 ## Installation
 
 1. Install [uv](https://github.com/astral-sh/uv): `pip install uv`

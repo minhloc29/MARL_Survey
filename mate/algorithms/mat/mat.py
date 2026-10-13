@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 import numpy as np
 import torch
@@ -13,6 +13,7 @@ from torch import nn
 from torch.distributions import Categorical
 
 from mate.algorithms.rode.environment import make_mate_rode_env
+from mate.algorithms._wandb import WandbLogger
 
 
 class MATPolicy(nn.Module):
@@ -137,6 +138,7 @@ class MATConfig:
     device: str = "cpu"
     seed: int = 0
     outdir: str = "ckpts/mat"
+    wandb_api: Optional[str] = None
 
 
 class MATTrainer:
@@ -157,6 +159,7 @@ class MATTrainer:
         ).to(self.device)
         self.optimizer = torch.optim.Adam(
             self.policy.parameters(), lr=config.lr)
+        self.wandb = WandbLogger("mate-mat", "mat", dict(config.__dict__), config.wandb_api)
 
     def collect_rollout(self):
         steps = self.config.rollout_steps
@@ -266,10 +269,13 @@ class MATTrainer:
             if (update + 1) % 10 == 0:
                 print(
                     f"update {update + 1}/{self.config.updates} | reward {reward:.3f} | policy {policy_loss:.4f} | value {value_loss:.4f}", flush=True)
+                self.wandb.log({"reward": reward, "policy_loss": policy_loss,
+                                "value_loss": value_loss}, step=update + 1)
         output = Path(self.config.outdir)
         output.mkdir(parents=True, exist_ok=True)
         torch.save({"policy": self.policy.state_dict(),
                    "config": self.config.__dict__}, output / "latest.pt")
+        self.wandb.finish()
         self.env.close()
 
 
@@ -281,4 +287,5 @@ def run_mat(args: Any) -> None:
         minibatch_size=args.mat_minibatch_size, d_model=args.mat_d_model,
         n_heads=args.mat_n_heads, n_layers=args.mat_n_layers,
         device=args.device, seed=args.seed, outdir=args.mat_outdir,
+        wandb_api=args.wandb_api,
     )).train()

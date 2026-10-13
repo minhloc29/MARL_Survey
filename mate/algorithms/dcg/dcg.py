@@ -30,6 +30,7 @@ from torch import nn
 
 from mate.algorithms.rode.environment import make_mate_rode_env
 from mate.algorithms.rode.replay import RODEEpisodeBuilder, RODEEpisodeReplay
+from mate.algorithms._wandb import WandbLogger
 
 
 # ============================================================================
@@ -423,6 +424,7 @@ class DCGConfig:
     device: str = "cpu"
     seed: int = 0
     outdir: str = "ckpts/dcg"
+    wandb_api: Optional[str] = None
 
 
 class DCGTrainer:
@@ -458,6 +460,7 @@ class DCGTrainer:
         self.replay = RODEEpisodeReplay(config.replay_capacity, self.device)
         self.epsilon = config.epsilon_start
         self._env_steps = 0
+        self.wandb = WandbLogger("mate-dcg", "dcg", dict(config.__dict__), config.wandb_api)
 
     # ------------------------------------------------------ exploration
 
@@ -577,10 +580,14 @@ class DCGTrainer:
                 if last_loss is not None:
                     msg += f" | loss {last_loss:.4f}"
                 print(msg, flush=True)
+                self.wandb.log({"reward": reward,
+                                "loss": last_loss if last_loss is not None else float("nan")},
+                               step=episode_index + 1)
         outdir = Path(cfg.outdir)
         outdir.mkdir(parents=True, exist_ok=True)
         torch.save({"network": self.network.state_dict(), "config": cfg.__dict__},
                    outdir / "latest.pt")
+        self.wandb.finish()
         self.env.close()
 
 
@@ -602,4 +609,5 @@ def run_dcg(args: Any) -> None:
         device=args.device,
         seed=args.seed,
         outdir=args.dcg_outdir,
+        wandb_api=args.wandb_api,
     )).train()

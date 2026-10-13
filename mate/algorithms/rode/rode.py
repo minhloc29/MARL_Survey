@@ -5,7 +5,7 @@ from __future__ import annotations
 import copy
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 import numpy as np
 import torch
@@ -14,6 +14,7 @@ from torch import nn
 from flow.nets import MonotonicMixer
 from mate.algorithms.rode.environment import make_mate_rode_env
 from mate.algorithms.rode.replay import RODEEpisodeBuilder, RODEEpisodeReplay
+from mate.algorithms._wandb import WandbLogger
 
 
 class RODENetwork(nn.Module):
@@ -69,6 +70,7 @@ class RODEConfig:
     device: str = "cpu"
     seed: int = 0
     outdir: str = "ckpts/rode"
+    wandb_api: Optional[str] = None
 
 
 class RODETrainer:
@@ -96,6 +98,8 @@ class RODETrainer:
             list(self.online.parameters()) + list(self.mixer.parameters()), lr=config.lr
         )
         self.replay = RODEEpisodeReplay(config.replay_capacity, self.device)
+        self.wandb = WandbLogger(
+            "mate-rode", "rode", dict(config.__dict__), config.wandb_api)
 
     def collect_episode(self, episode_index: int):
         obs, state = self.env.reset(seed=self.config.seed + episode_index)
@@ -187,12 +191,15 @@ class RODETrainer:
             if (episode_index + 1) % 10 == 0:
                 print(
                     f"episode {episode_index + 1}/{self.config.episodes} | reward {reward:.3f} | loss {loss}", flush=True)
+                self.wandb.log({"reward": reward, "loss": loss if loss is not None else float("nan")},
+                               step=episode_index + 1)
             if (episode_index + 1) % self.config.target_update_every == 0:
                 self.target.load_state_dict(self.online.state_dict())
                 self.target_mixer.load_state_dict(self.mixer.state_dict())
         Path(self.config.outdir).mkdir(parents=True, exist_ok=True)
         torch.save({"online": self.online.state_dict(
         ), "mixer": self.mixer.state_dict()}, Path(self.config.outdir) / "latest.pt")
+        self.wandb.finish()
         self.env.close()
 
 
@@ -209,4 +216,5 @@ def run_rode(args: Any) -> None:
         device=args.device,
         seed=args.seed,
         outdir=args.rode_outdir,
+        wandb_api=args.wandb_api,
     )).train()
