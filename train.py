@@ -168,7 +168,7 @@ def _denormalize_maddpq(a_norm: np.ndarray) -> np.ndarray:
 
 
 def add_common_args(parser):
-    parser.add_argument("--algo", choices=["ppo", "mappo", "maddpq", "qmix", "qplex", "rode", "coma", "mat", "dcg", "i2c"], default="mappo",
+    parser.add_argument("--algo", choices=["ppo", "mappo", "maddpq", "qmix", "qplex", "rode", "coma", "mat", "dcg", "i2c", "dm2", "facmac"], default="mappo",
                         help="Training algorithm to run.")
     parser.add_argument("--device", type=str, default="cpu",
                         help="Device to run training on: 'auto', 'cuda', 'mps' (Apple Silicon), or 'cpu'.")
@@ -653,6 +653,61 @@ def run_qplex(args):
     run_vd(args, "qplex")
 
 
+def run_dm2(args):
+    """DM²: on-policy IPPO + GAIL distribution matching (discrete camera team)."""
+    from mate.algorithms.dm2 import DM2Config, DM2Trainer
+
+    data_paths = None
+    if args.dm2_gail_data_paths:
+        data_paths = [p.strip() for p in args.dm2_gail_data_paths.split(",") if p.strip()]
+
+    rt = args.dm2_rew_type
+    # GAIL reward shaping needs either external demos or the self-imitation flag.
+    if rt in ("gail", "mixed"):
+        if not data_paths and not args.dm2_gail_sil:
+            if args.dm2_update_gail:
+                raise SystemExit(
+                    "--algo dm2 with rew-type gail/mixed requires either "
+                    "--dm2-gail-data-paths or --dm2-gail-sil")
+    else:
+        args.dm2_update_gail = False
+
+    cfg = DM2Config(
+        config=args.dm2_config, levels=args.dm2_levels,
+        episode_limit=args.dm2_episode_limit, episodes=args.dm2_episodes,
+        hidden=args.dm2_hidden, rew_type=rt,
+        update_gail=args.dm2_update_gail, gail_rew_coef=args.dm2_gail_rew_coef,
+        gail_epoch=args.dm2_gail_epoch, gail_batch_size=args.dm2_gail_batch_size,
+        gail_state_discrim=args.dm2_gail_state_discrim,
+        gail_sil=args.dm2_gail_sil, gail_buffer_size=args.dm2_gail_buffer_size,
+        gail_data_paths=data_paths, gail_exp_eps=args.dm2_gail_exp_eps,
+        gail_exp_use_same_data_idxs=args.dm2_gail_use_same_idxs,
+        train_after=args.dm2_train_after, ppo_epoch=args.dm2_ppo_epoch,
+        clip_param=args.dm2_clip_param, lr=args.dm2_lr,
+        gamma=args.dm2_gamma, gae_lambda=args.dm2_gae_lambda,
+        device=args.device, seed=args.seed, outdir=args.dm2_outdir,
+    )
+    DM2Trainer(cfg).train()
+
+
+def run_facmac(args):
+    """FACMAC: off-policy factored centralised policy gradients (discrete)."""
+    from mate.algorithms.facmac import FACMACConfig, FACMACTrainer
+
+    cfg = FACMACConfig(
+        config=args.facmac_config, levels=args.facmac_levels,
+        episode_limit=args.facmac_episode_limit, episodes=args.facmac_episodes,
+        hidden=args.facmac_hidden, lr=args.facmac_lr, critic_lr=args.facmac_critic_lr,
+        gamma=args.facmac_gamma, td_lambda=args.facmac_td_lambda,
+        batch_size=args.facmac_batch_size, buffer_size=args.facmac_buffer_size,
+        gumbel_tau=args.facmac_gumbel_tau,
+        target_update_interval=args.facmac_target_update_interval,
+        epsilon_start=args.facmac_epsilon_start, epsilon_finish=args.facmac_epsilon_finish,
+        device=args.device, seed=args.seed, outdir=args.facmac_outdir,
+    )
+    FACMACTrainer(cfg).train()
+
+
 def main():
     parser = ArgumentParser()
     add_common_args(parser)
@@ -750,6 +805,47 @@ def main():
     parser.add_argument("--i2c-actor-lr", type=float, default=1e-4)
     parser.add_argument("--i2c-critic-lr", type=float, default=1e-3)
     parser.add_argument("--i2c-outdir", default="ckpts/i2c")
+    parser.add_argument("--dm2-config", default="MATE-4v8-9.yaml")
+    parser.add_argument("--dm2-levels", type=int, default=3)
+    parser.add_argument("--dm2-episode-limit", type=int, default=64)
+    parser.add_argument("--dm2-episodes", type=int, default=1000)
+    parser.add_argument("--dm2-hidden", type=int, default=64)
+    parser.add_argument("--dm2-rew-type", type=str, default="mixed",
+                        choices=["env", "gail", "mixed"])
+    parser.add_argument("--dm2-update-gail", action="store_true")
+    parser.add_argument("--dm2-gail-rew-coef", type=float, default=1.0)
+    parser.add_argument("--dm2-gail-epoch", type=int, default=3)
+    parser.add_argument("--dm2-gail-batch-size", type=int, default=8)
+    parser.add_argument("--dm2-gail-state-discrim", action="store_true")
+    parser.add_argument("--dm2-gail-sil", action="store_true")
+    parser.add_argument("--dm2-gail-buffer-size", type=int, default=100)
+    parser.add_argument("--dm2-gail-data-paths", type=str, default=None,
+                        help="Comma-separated expert demo dirs for GAIL.")
+    parser.add_argument("--dm2-gail-exp-eps", type=int, default=1000)
+    parser.add_argument("--dm2-gail-use-same-idxs", action="store_true")
+    parser.add_argument("--dm2-train-after", type=int, default=16)
+    parser.add_argument("--dm2-ppo-epoch", type=int, default=15)
+    parser.add_argument("--dm2-clip-param", type=float, default=0.2)
+    parser.add_argument("--dm2-lr", type=float, default=3e-4)
+    parser.add_argument("--dm2-gamma", type=float, default=0.99)
+    parser.add_argument("--dm2-gae-lambda", type=float, default=0.95)
+    parser.add_argument("--dm2-outdir", default="ckpts/dm2")
+    parser.add_argument("--facmac-config", default="MATE-4v8-9.yaml")
+    parser.add_argument("--facmac-levels", type=int, default=3)
+    parser.add_argument("--facmac-episode-limit", type=int, default=64)
+    parser.add_argument("--facmac-episodes", type=int, default=2000)
+    parser.add_argument("--facmac-hidden", type=int, default=64)
+    parser.add_argument("--facmac-lr", type=float, default=2.5e-3)
+    parser.add_argument("--facmac-critic-lr", type=float, default=5e-4)
+    parser.add_argument("--facmac-gamma", type=float, default=0.99)
+    parser.add_argument("--facmac-td-lambda", type=float, default=0.8)
+    parser.add_argument("--facmac-batch-size", type=int, default=32)
+    parser.add_argument("--facmac-buffer-size", type=int, default=5000)
+    parser.add_argument("--facmac-gumbel-tau", type=float, default=1.0)
+    parser.add_argument("--facmac-target-update-interval", type=int, default=200)
+    parser.add_argument("--facmac-epsilon-start", type=float, default=0.5)
+    parser.add_argument("--facmac-epsilon-finish", type=float, default=0.05)
+    parser.add_argument("--facmac-outdir", default="ckpts/facmac")
 
     args = parser.parse_args()
     if args.wandb_api is None:
@@ -772,6 +868,8 @@ def main():
     dispatcher["mat"] = run_mat
     dispatcher["dcg"] = run_dcg
     dispatcher["i2c"] = run_i2c
+    dispatcher["dm2"] = run_dm2
+    dispatcher["facmac"] = run_facmac
     dispatcher[args.algo](args)
 
 
