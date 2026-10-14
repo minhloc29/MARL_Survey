@@ -134,7 +134,9 @@ def make_env(**kwargs):
 def make_maddpq_env(config_name: str = "MATE-4v8-9.yaml"):
     """Raw continuous-action env for MADDPG (no goal-mask wrapper)."""
     base_env = gym.make("MultiAgentTracking-v0", config=config_name)
-    return mate.MultiCamera.make(base_env, target_agent=GreedyTargetAgent())
+    return mate.wrappers.CoverageReward(
+        mate.MultiCamera.make(base_env, target_agent=GreedyTargetAgent())
+    )
 
 
 def make_discrete_env(config_name: str = "MATE-4v8-9.yaml", levels: int = 5):
@@ -147,7 +149,9 @@ def make_discrete_env(config_name: str = "MATE-4v8-9.yaml", levels: int = 5):
     """
     base_env = gym.make("MultiAgentTracking-v0", config=config_name)
     base_env = mate.DiscreteCamera(base_env, levels=levels)
-    return mate.MultiCamera.make(base_env, target_agent=GreedyTargetAgent())
+    return mate.wrappers.CoverageReward(
+        mate.MultiCamera.make(base_env, target_agent=GreedyTargetAgent())
+    )
 
 
 # QMIX/QPLEX discrete camera action count (levels=5 -> 25 per camera).

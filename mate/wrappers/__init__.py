@@ -2,6 +2,7 @@
 
 from mate.wrappers import typing
 from mate.wrappers.auxiliary_camera_rewards import AuxiliaryCameraRewards
+from mate.wrappers.coverage_reward import CoverageReward
 from mate.wrappers.auxiliary_target_rewards import AuxiliaryTargetRewards
 from mate.wrappers.discrete_action_spaces import DiscreteCamera, DiscreteTarget
 from mate.wrappers.enhanced_observation import EnhancedObservation

@@ -168,7 +168,9 @@ def make_mate_rode_env(
     """Create a discrete camera-team MATE environment for RODE."""
     base_env = gym.make("MultiAgentTracking-v0", config=config, **kwargs)
     discretizer = mate.wrappers.DiscreteCamera(base_env, levels=levels)
-    camera_env = mate.MultiCamera(base_env, target_agent=GreedyTargetAgent())
+    camera_env = mate.wrappers.CoverageReward(
+        mate.MultiCamera(base_env, target_agent=GreedyTargetAgent())
+    )
     return MateRodeEnv(
         camera_env,
         episode_limit=episode_limit,
