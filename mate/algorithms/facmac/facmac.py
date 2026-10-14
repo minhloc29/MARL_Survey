@@ -118,6 +118,7 @@ class FACMACConfig:
     levels: int = 3
     episode_limit: int = 64
     episodes: int = 2000
+    total_env_steps: Optional[int] = None
     seed: int = 0
     device: str = "cpu"
     hidden: int = 64
@@ -299,7 +300,11 @@ class FACMACTrainer:
         cfg = self.config
         Path(cfg.outdir).mkdir(parents=True, exist_ok=True)
         env_steps_at_last_learn = 0
-        for ep in range(cfg.episodes):
+        ep = 0
+        while ep < cfg.episodes:
+            if (cfg.total_env_steps is not None
+                    and self._env_steps >= cfg.total_env_steps):
+                break
             total, coverage_rate = self.collect_episode(ep)
             self._schedule_epsilon()
             if (self._env_steps - env_steps_at_last_learn) >= cfg.update_every \
@@ -316,6 +321,7 @@ class FACMACTrainer:
                                     "pg_loss": pl, "epsilon": self.epsilon}, step=ep)
             if ep % cfg.save_every == 0:
                 self.save()
+            ep += 1
 
     def save(self) -> None:
         out = Path(self.config.outdir)

@@ -55,6 +55,7 @@ class RODEConfig:
     levels: int = 3
     episode_limit: int = 64
     episodes: int = 1000
+    total_env_steps: Optional[int] = None
     warmup_episodes: int = 8
     batch_size: int = 8
     replay_capacity: int = 500
@@ -100,6 +101,7 @@ class RODETrainer:
         self.replay = RODEEpisodeReplay(config.replay_capacity, self.device)
         self.wandb = WandbLogger(
             "mate-rode", "rode", dict(config.__dict__), config.wandb_api)
+        self._env_steps = 0
 
     def collect_episode(self, episode_index: int):
         obs, state = self.env.reset(seed=self.config.seed + episode_index)
@@ -117,6 +119,7 @@ class RODETrainer:
         n_steps = 0
         for _ in range(self.config.episode_limit):
             n_steps += 1
+            self._env_steps += 1
             obs_tensor = torch.as_tensor(
                 obs, dtype=torch.float32, device=self.device).unsqueeze(0).unsqueeze(0)
             with torch.no_grad():
@@ -184,7 +187,13 @@ class RODETrainer:
         return float(loss.detach().cpu())
 
     def train(self) -> None:
-        for episode_index in range(self.config.episodes):
+        episode_index = 0
+        while episode_index < self.config.episodes:
+            # Honor a shared env-step budget (default 10M policy actions); each
+            # episode consumes 1..episode_limit env steps.
+            if (self.config.total_env_steps is not None
+                    and self._env_steps >= self.config.total_env_steps):
+                break
             episode, reward, coverage_rate = self.collect_episode(episode_index)
             self.replay.add(episode)
             loss = None
@@ -199,6 +208,7 @@ class RODETrainer:
             if (episode_index + 1) % self.config.target_update_every == 0:
                 self.target.load_state_dict(self.online.state_dict())
                 self.target_mixer.load_state_dict(self.mixer.state_dict())
+            episode_index += 1
         Path(self.config.outdir).mkdir(parents=True, exist_ok=True)
         torch.save({"online": self.online.state_dict(
         ), "mixer": self.mixer.state_dict()}, Path(self.config.outdir) / "latest.pt")
@@ -207,11 +217,18 @@ class RODETrainer:
 
 
 def run_rode(args: Any) -> None:
+    # Shared env-step budget governs the run; `--rode-episodes` is an explicit
+    # override / hard ceiling on top of it.
+    total_env_steps = getattr(args, "total_timesteps", 10_000_000)
+    episodes = args.rode_episodes
+    if episodes is None:
+        episodes = total_env_steps // args.rode_episode_limit + 1
     RODETrainer(RODEConfig(
         config=args.rode_config,
         levels=args.rode_levels,
         episode_limit=args.rode_episode_limit,
-        episodes=args.rode_episodes,
+        episodes=episodes,
+        total_env_steps=total_env_steps,
         batch_size=args.rode_batch_size,
         warmup_episodes=args.rode_warmup_episodes,
         n_roles=args.rode_n_roles,

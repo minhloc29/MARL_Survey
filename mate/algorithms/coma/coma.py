@@ -79,6 +79,7 @@ class COMAConfig:
     levels: int = 3
     episode_limit: int = 64
     episodes: int = 1000
+    total_env_steps: Optional[int] = None
     update_every: int = 8
     batch_size: int = 8
     replay_capacity: int = 128
@@ -122,6 +123,7 @@ class COMATrainer:
             self.critic.parameters(), lr=config.critic_lr)
         self.replay = RODEEpisodeReplay(config.replay_capacity, self.device)
         self.wandb = WandbLogger("mate-coma", "coma", dict(config.__dict__), config.wandb_api)
+        self._env_steps = 0
 
     def collect_episode(self, episode_index: int):
         obs, state = self.env.reset(seed=self.config.seed + episode_index)
@@ -132,6 +134,7 @@ class COMATrainer:
         n_steps = 0
         for _ in range(self.config.episode_limit):
             n_steps += 1
+            self._env_steps += 1
             obs_tensor = torch.as_tensor(
                 obs, dtype=torch.float32, device=self.device).unsqueeze(0).unsqueeze(0)
             with torch.no_grad():
@@ -198,7 +201,11 @@ class COMATrainer:
 
     def train(self) -> None:
         last_losses = (None, None)
-        for episode_index in range(self.config.episodes):
+        episode_index = 0
+        while episode_index < self.config.episodes:
+            if (self.config.total_env_steps is not None
+                    and self._env_steps >= self.config.total_env_steps):
+                break
             episode, reward, coverage_rate = self.collect_episode(episode_index)
             self.replay.add(episode)
             if (episode_index + 1) % self.config.update_every == 0 and len(self.replay) >= self.config.batch_size:
@@ -215,6 +222,7 @@ class COMATrainer:
                                step=episode_index + 1)
             if (episode_index + 1) % self.config.target_update_every == 0:
                 self.target_critic.load_state_dict(self.critic.state_dict())
+            episode_index += 1
         Path(self.config.outdir).mkdir(parents=True, exist_ok=True)
         torch.save({"actor": self.actor.state_dict(
         ), "critic": self.critic.state_dict()}, Path(self.config.outdir) / "latest.pt")
@@ -223,11 +231,16 @@ class COMATrainer:
 
 
 def run_coma(args: Any) -> None:
+    total_env_steps = getattr(args, "total_timesteps", 10_000_000)
+    episodes = args.coma_episodes
+    if episodes is None:
+        episodes = total_env_steps // args.coma_episode_limit + 1
     COMATrainer(COMAConfig(
         config=args.coma_config,
         levels=args.coma_levels,
         episode_limit=args.coma_episode_limit,
-        episodes=args.coma_episodes,
+        episodes=episodes,
+        total_env_steps=total_env_steps,
         update_every=args.coma_update_every,
         batch_size=args.coma_batch_size,
         device=args.device,

@@ -281,9 +281,15 @@ class MATTrainer:
 
 
 def run_mat(args: Any) -> None:
+    # Deterministic: each update collects exactly `rollout_steps` env steps, so
+    # the shared env-step budget maps 1:1 to updates. `--mat-updates` overrides.
+    total_env_steps = getattr(args, "total_timesteps", 10_000_000)
+    updates = args.mat_updates
+    if updates is None:
+        updates = max(1, total_env_steps // args.mat_rollout_steps)
     MATTrainer(MATConfig(
         config=args.mat_config, levels=args.mat_levels,
-        episode_limit=args.mat_episode_limit, updates=args.mat_updates,
+        episode_limit=args.mat_episode_limit, updates=updates,
         rollout_steps=args.mat_rollout_steps, ppo_epochs=args.mat_ppo_epochs,
         minibatch_size=args.mat_minibatch_size, d_model=args.mat_d_model,
         n_heads=args.mat_n_heads, n_layers=args.mat_n_layers,

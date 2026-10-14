@@ -185,6 +185,7 @@ class I2CConfig:
     levels: int = 3
     episode_limit: int = 64
     episodes: int = 1000
+    total_env_steps: Optional[int] = None
     update_every: int = 8          # train on the buffer after every N episodes
     batch_size: int = 32
     replay_capacity: int = 1000
@@ -235,6 +236,7 @@ class I2CTrainer:
         self.critic_optimizer = torch.optim.Adam(self.critic.parameters(), lr=config.critic_lr)
         self.replay = RODEEpisodeReplay(config.replay_capacity, self.device)
         self.wandb = WandbLogger("mate-i2c", "i2c", dict(config.__dict__), config.wandb_api)
+        self._env_steps = 0
 
     # ------------------------------------------------------------ collection
 
@@ -246,6 +248,7 @@ class I2CTrainer:
         n_steps = 0
         for _ in range(self.config.episode_limit):
             n_steps += 1
+            self._env_steps += 1
             obs_t = torch.as_tensor(obs, dtype=torch.float32, device=self.device).unsqueeze(0)
             with torch.no_grad():
                 logits, _ = self.actor(obs_t)          # (1, N, A)
@@ -379,7 +382,11 @@ class I2CTrainer:
     def train(self) -> None:
         cfg = self.config
         last = (None, None, None)
-        for episode_index in range(cfg.episodes):
+        episode_index = 0
+        while episode_index < cfg.episodes:
+            if (cfg.total_env_steps is not None
+                    and self._env_steps >= cfg.total_env_steps):
+                break
             episode, reward, coverage_rate = self.collect_episode(episode_index)
             self.replay.add(episode)
             if (episode_index + 1) % cfg.update_every == 0 and len(self.replay) >= cfg.batch_size:
@@ -395,6 +402,7 @@ class I2CTrainer:
                                 "critic_loss": last[1] if last[1] is not None else float("nan"),
                                 "blz": last[2] if last[2] is not None else float("nan")},
                                step=episode_index + 1)
+            episode_index += 1
         outdir = Path(cfg.outdir)
         outdir.mkdir(parents=True, exist_ok=True)
         torch.save({"actor": self.actor.state_dict(), "critic": self.critic.state_dict(),
@@ -405,11 +413,16 @@ class I2CTrainer:
 
 def run_i2c(args: Any) -> None:
     """Entry point wired into ``train.py``'s algorithm dispatcher."""
+    total_env_steps = getattr(args, "total_timesteps", 10_000_000)
+    episodes = args.i2c_episodes
+    if episodes is None:
+        episodes = total_env_steps // args.i2c_episode_limit + 1
     I2CTrainer(I2CConfig(
         config=args.i2c_config,
         levels=args.i2c_levels,
         episode_limit=args.i2c_episode_limit,
-        episodes=args.i2c_episodes,
+        episodes=episodes,
+        total_env_steps=total_env_steps,
         update_every=args.i2c_update_every,
         batch_size=args.i2c_batch_size,
         hidden=args.i2c_hidden,

@@ -248,6 +248,8 @@ def run_maddpq(args):
     Uses the raw continuous camera action space (Box per camera), reusing
     flow/'s encoders, replay buffer, and polyak-update pattern.
     """
+    steps = args.total_timesteps if args.steps is None else args.steps
+    args.steps = steps
     from flow import CameraObsEncoder, MateObserver, ReplayBuffer, DeterministicActor
 
     torch.manual_seed(args.seed)
@@ -467,6 +469,8 @@ def run_vd(args, mixer_kind):
     combine the per-agent ``Q_i`` into a joint ``Q_tot`` (QMIX: monotonic
     hypernetwork; QPLEX: duplex-dueling transformation).
     """
+    steps = args.total_timesteps if args.steps is None else args.steps
+    args.steps = steps
     from flow import CameraObsEncoder, MateObserver, ReplayBuffer
     from flow import AgentQNetwork, QplexMixer, encode_joint
     from flow.nets import MonotonicMixer
@@ -697,7 +701,10 @@ def run_dm2(args):
 
     cfg = DM2Config(
         config=args.dm2_config, levels=args.dm2_levels,
-        episode_limit=args.dm2_episode_limit, episodes=args.dm2_episodes,
+        episode_limit=args.dm2_episode_limit,
+        episodes=args.dm2_episodes if args.dm2_episodes is not None
+        else args.total_timesteps // args.dm2_episode_limit + 1,
+        total_env_steps=args.total_timesteps,
         hidden=args.dm2_hidden, rew_type=rt,
         update_gail=args.dm2_update_gail, gail_rew_coef=args.dm2_gail_rew_coef,
         gail_epoch=args.dm2_gail_epoch, gail_batch_size=args.dm2_gail_batch_size,
@@ -720,7 +727,10 @@ def run_facmac(args):
 
     cfg = FACMACConfig(
         config=args.facmac_config, levels=args.facmac_levels,
-        episode_limit=args.facmac_episode_limit, episodes=args.facmac_episodes,
+        episode_limit=args.facmac_episode_limit,
+        episodes=args.facmac_episodes if args.facmac_episodes is not None
+        else args.total_timesteps // args.facmac_episode_limit + 1,
+        total_env_steps=args.total_timesteps,
         hidden=args.facmac_hidden, lr=args.facmac_lr, critic_lr=args.facmac_critic_lr,
         gamma=args.facmac_gamma, td_lambda=args.facmac_td_lambda,
         batch_size=args.facmac_batch_size, buffer_size=args.facmac_buffer_size,
@@ -761,7 +771,7 @@ def main():
     parser.add_argument("--gamma", type=float, default=0.99)
     parser.add_argument("--tau", type=float, default=0.005)
     parser.add_argument("--noise-scale", type=float, default=0.1)
-    parser.add_argument("--steps", type=int, default=50_000)
+    parser.add_argument("--steps", type=int, default=None)
     parser.add_argument("--log-every", type=int, default=200)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--wandb-api", default=None,
@@ -779,7 +789,7 @@ def main():
     parser.add_argument("--rode-config", default="MATE-4v8-9.yaml")
     parser.add_argument("--rode-levels", type=int, default=3)
     parser.add_argument("--rode-episode-limit", type=int, default=64)
-    parser.add_argument("--rode-episodes", type=int, default=1000)
+    parser.add_argument("--rode-episodes", type=int, default=None)
     parser.add_argument("--rode-batch-size", type=int, default=8)
     parser.add_argument("--rode-warmup-episodes", type=int, default=8)
     parser.add_argument("--rode-n-roles", type=int, default=3)
@@ -788,14 +798,14 @@ def main():
     parser.add_argument("--coma-config", default="MATE-4v8-9.yaml")
     parser.add_argument("--coma-levels", type=int, default=3)
     parser.add_argument("--coma-episode-limit", type=int, default=64)
-    parser.add_argument("--coma-episodes", type=int, default=1000)
+    parser.add_argument("--coma-episodes", type=int, default=None)
     parser.add_argument("--coma-update-every", type=int, default=8)
     parser.add_argument("--coma-batch-size", type=int, default=8)
     parser.add_argument("--coma-outdir", default="ckpts/coma")
     parser.add_argument("--mat-config", default="MATE-4v8-9.yaml")
     parser.add_argument("--mat-levels", type=int, default=3)
     parser.add_argument("--mat-episode-limit", type=int, default=64)
-    parser.add_argument("--mat-updates", type=int, default=1000)
+    parser.add_argument("--mat-updates", type=int, default=None)
     parser.add_argument("--mat-rollout-steps", type=int, default=128)
     parser.add_argument("--mat-ppo-epochs", type=int, default=4)
     parser.add_argument("--mat-minibatch-size", type=int, default=64)
@@ -806,7 +816,7 @@ def main():
     parser.add_argument("--dcg-config", default="MATE-4v8-9.yaml")
     parser.add_argument("--dcg-levels", type=int, default=3)
     parser.add_argument("--dcg-episode-limit", type=int, default=64)
-    parser.add_argument("--dcg-episodes", type=int, default=1000)
+    parser.add_argument("--dcg-episodes", type=int, default=None)
     parser.add_argument("--dcg-update-every", type=int, default=8)
     parser.add_argument("--dcg-batch-size", type=int, default=8)
     parser.add_argument("--dcg-hidden", type=int, default=64)
@@ -819,7 +829,7 @@ def main():
     parser.add_argument("--i2c-config", default="MATE-4v8-9.yaml")
     parser.add_argument("--i2c-levels", type=int, default=3)
     parser.add_argument("--i2c-episode-limit", type=int, default=64)
-    parser.add_argument("--i2c-episodes", type=int, default=1000)
+    parser.add_argument("--i2c-episodes", type=int, default=None)
     parser.add_argument("--i2c-update-every", type=int, default=8)
     parser.add_argument("--i2c-batch-size", type=int, default=32)
     parser.add_argument("--i2c-hidden", type=int, default=128)
@@ -833,7 +843,7 @@ def main():
     parser.add_argument("--dm2-config", default="MATE-4v8-9.yaml")
     parser.add_argument("--dm2-levels", type=int, default=3)
     parser.add_argument("--dm2-episode-limit", type=int, default=64)
-    parser.add_argument("--dm2-episodes", type=int, default=1000)
+    parser.add_argument("--dm2-episodes", type=int, default=None)
     parser.add_argument("--dm2-hidden", type=int, default=64)
     parser.add_argument("--dm2-rew-type", type=str, default="mixed",
                         choices=["env", "gail", "mixed"])
@@ -858,7 +868,7 @@ def main():
     parser.add_argument("--facmac-config", default="MATE-4v8-9.yaml")
     parser.add_argument("--facmac-levels", type=int, default=3)
     parser.add_argument("--facmac-episode-limit", type=int, default=64)
-    parser.add_argument("--facmac-episodes", type=int, default=2000)
+    parser.add_argument("--facmac-episodes", type=int, default=None)
     parser.add_argument("--facmac-hidden", type=int, default=64)
     parser.add_argument("--facmac-lr", type=float, default=2.5e-3)
     parser.add_argument("--facmac-critic-lr", type=float, default=5e-4)

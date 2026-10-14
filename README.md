@@ -43,6 +43,30 @@ python train.py --algo mappo --device auto   # cuda, mps (Apple Silicon), or cpu
 For per-algorithm options (learning rates, epsilon, batch size, target-update
 cadence, etc.) run `python train.py --help` or see the `--<algo>-*` flags.
 
+### Shared training budget (default 10M)
+
+Every algorithm — PPO/MAPPO **and** the `--algo` suite — trains for the same
+number of **policy actions**, controlled by one flag:
+
+```bash
+python train.py --algo mappo   --total-timesteps 10000000  # on-policy PPO/MAPPO
+python train.py --algo qmix    --total-timesteps 10000000  # off-policy value decomposition
+python train.py --algo coma    --total-timesteps 10000000  # episode-based off-policy
+python train.py --algo mat     --total-timesteps 10000000  # deterministic (updates = steps / rollout)
+```
+
+`--total-timesteps` (default `10_000_000`) is the single shared budget for all 12
+algorithms, so their wandb curves are comparable. 1 step = 1 RL policy action;
+PPO/MAPPO additionally apply frame-skip (8 env transitions per action) as part of
+their hierarchical design.
+
+The per-algorithm count flags (`--steps`, `--<algo>-episodes`, `--mat-updates`)
+default to `None` and are derived from `--total-timesteps`. Episode-based algos
+(rode, coma, dcg, i2c, dm2, facmac) run under a live env-step accumulator and stop
+at the budget even though they terminate episodes early on `done`; mat derives
+`updates = total_timesteps // rollout_steps` exactly. You may still override any
+count flag explicitly, e.g. `--algo mat --mat-updates 1000`.
+
 Every algorithm logs rewards and losses to **W&B** when an API key is provided
 (`--wandb-api <key>`, or the `WANDB_API_KEY` env var), one run per algorithm;
 training still runs normally without one.

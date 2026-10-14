@@ -283,6 +283,7 @@ class DM2Config:
     levels: int = 3
     episode_limit: int = 64
     episodes: int = 1000
+    total_env_steps: Optional[int] = None
     seed: int = 0
     device: str = "cpu"
     hidden: int = 64
@@ -514,9 +515,14 @@ class DM2Trainer:
     def train(self) -> None:
         cfg = self.config
         Path(cfg.outdir).mkdir(parents=True, exist_ok=True)
-        for ep in range(cfg.episodes):
+        ep = 0
+        while ep < cfg.episodes:
+            if (cfg.total_env_steps is not None
+                    and self._env_steps >= cfg.total_env_steps):
+                break
             rt, coverage_rate = self.collect_episode(cfg.seed + ep)
             if len(self._episodes) < cfg.train_after:
+                ep += 1
                 continue
             if cfg.use_linear_lr_decay:
                 lr = max(_linear_anneal(cfg.lr, ep, cfg.episodes), 1e-6)
@@ -532,6 +538,7 @@ class DM2Trainer:
             self.wandb.log({"reward": rt, "coverage_rate": coverage_rate, **info}, step=ep)
             if ep % cfg.save_every == 0:
                 self.save()
+            ep += 1
 
     def save(self) -> None:
         out = Path(self.config.outdir)

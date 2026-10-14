@@ -400,6 +400,7 @@ class DCGConfig:
     levels: int = 3
     episode_limit: int = 64
     episodes: int = 1000
+    total_env_steps: Optional[int] = None
     update_every: int = 8  # train on the buffer after every N collected episodes
     batch_size: int = 8
     replay_capacity: int = 500
@@ -570,7 +571,11 @@ class DCGTrainer:
     def train(self) -> None:
         cfg = self.config
         last_loss: Optional[float] = None
-        for episode_index in range(cfg.episodes):
+        episode_index = 0
+        while episode_index < cfg.episodes:
+            if (cfg.total_env_steps is not None
+                    and self._env_steps >= cfg.total_env_steps):
+                break
             episode, reward, coverage_rate = self.collect_episode(episode_index)
             self.replay.add(episode)
             if (episode_index + 1) % cfg.update_every == 0 and len(self.replay) >= cfg.batch_size:
@@ -586,6 +591,7 @@ class DCGTrainer:
                                 "coverage_rate": coverage_rate,
                                 "loss": last_loss if last_loss is not None else float("nan")},
                                step=episode_index + 1)
+            episode_index += 1
         outdir = Path(cfg.outdir)
         outdir.mkdir(parents=True, exist_ok=True)
         torch.save({"network": self.network.state_dict(), "config": cfg.__dict__},
@@ -596,11 +602,16 @@ class DCGTrainer:
 
 def run_dcg(args: Any) -> None:
     """Entry point wired into ``train.py``'s algorithm dispatcher."""
+    total_env_steps = getattr(args, "total_timesteps", 10_000_000)
+    episodes = args.dcg_episodes
+    if episodes is None:
+        episodes = total_env_steps // args.dcg_episode_limit + 1
     DCGTrainer(DCGConfig(
         config=args.dcg_config,
         levels=args.dcg_levels,
         episode_limit=args.dcg_episode_limit,
-        episodes=args.dcg_episodes,
+        episodes=episodes,
+        total_env_steps=total_env_steps,
         update_every=args.dcg_update_every,
         batch_size=args.dcg_batch_size,
         hidden=args.dcg_hidden,
