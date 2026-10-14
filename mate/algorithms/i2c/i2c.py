@@ -243,7 +243,9 @@ class I2CTrainer:
         builder = RODEEpisodeBuilder(self.env.n_agents, self.env.obs_shape, self.env.n_actions)
         builder.start(obs, state, self.env.get_avail_actions())
         total_reward = 0.0
+        n_steps = 0
         for _ in range(self.config.episode_limit):
+            n_steps += 1
             obs_t = torch.as_tensor(obs, dtype=torch.float32, device=self.device).unsqueeze(0)
             with torch.no_grad():
                 logits, _ = self.actor(obs_t)          # (1, N, A)
@@ -262,7 +264,7 @@ class I2CTrainer:
             total_reward += reward
             if done:
                 break
-        return builder.finish(), total_reward
+        return builder.finish(), total_reward, total_reward / max(1, n_steps)
 
     # --------------------------------------------------------------- helpers
 
@@ -378,7 +380,7 @@ class I2CTrainer:
         cfg = self.config
         last = (None, None, None)
         for episode_index in range(cfg.episodes):
-            episode, reward = self.collect_episode(episode_index)
+            episode, reward, coverage_rate = self.collect_episode(episode_index)
             self.replay.add(episode)
             if (episode_index + 1) % cfg.update_every == 0 and len(self.replay) >= cfg.batch_size:
                 last = self.update(self.replay.sample(cfg.batch_size))
@@ -388,6 +390,7 @@ class I2CTrainer:
                     msg += (f" | actor {last[0]:.4f} | critic {last[1]:.4f} | blz {last[2]:.4f}")
                 print(msg, flush=True)
                 self.wandb.log({"reward": reward,
+                                "coverage_rate": coverage_rate,
                                 "actor_loss": last[0] if last[0] is not None else float("nan"),
                                 "critic_loss": last[1] if last[1] is not None else float("nan"),
                                 "blz": last[2] if last[2] is not None else float("nan")},

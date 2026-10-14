@@ -447,7 +447,8 @@ def run_maddpq(args):
 
             if wandb_run is not None:
                 wandb_run.log({"maddpq/critic_loss": loss_critic.item(),
-                               "maddpq/actor_loss": loss_actor.item()})
+                               "maddpq/actor_loss": loss_actor.item(),
+                               "maddpq/coverage_rate": last_ep_coverage})
 
         if (step + 1) % args.log_every == 0:
             print(f"step {step+1}/{args.steps} | last_ep_rew {last_ep_reward:.3f} "
@@ -561,6 +562,8 @@ def run_vd(args, mixer_kind):
     episode_reward = 0.0
     episode_len = 0
     last_ep_reward = 0.0
+    episode_coverage = 0.0
+    last_ep_coverage = 0.0
 
     hard_update()  # sync targets at start
 
@@ -584,13 +587,20 @@ def run_vd(args, mixer_kind):
         replay.add(obs_np0[0], a_joint.cpu().numpy().astype(np.float64)[:, None],
                    float(reward), np.asarray(obs2, dtype=np.float64), done or truncated)
 
+        cam_infos = info.get("infos") if isinstance(info, dict) else None
+        step_coverage = float(
+            np.mean([c.get("coverage_rate", 0.0) for c in cam_infos])) if cam_infos else 0.0
+
         episode_reward += float(reward)
+        episode_coverage += step_coverage
         episode_len += 1
         obs = obs2
         obs_np0 = np.asarray(obs, dtype=np.float64)[None]
         if done or truncated:
             last_ep_reward = episode_reward
+            last_ep_coverage = episode_coverage / max(1, episode_len)
             episode_reward = 0.0
+            episode_coverage = 0.0
             episode_len = 0
             obs, _ = env.reset()
             obs_np0 = np.asarray(obs, dtype=np.float64)[None]
@@ -647,7 +657,8 @@ def run_vd(args, mixer_kind):
 
             if wandb_run is not None:
                 wandb_run.log({f"{mixer_kind}/loss": loss.item(),
-                               f"{mixer_kind}/eps": eps})
+                               f"{mixer_kind}/eps": eps,
+                               f"{mixer_kind}/coverage_rate": last_ep_coverage})
 
         if step % args.log_every == 0:
             print(f"step {step}/{args.steps} | last_ep_rew {last_ep_reward:.3f} "

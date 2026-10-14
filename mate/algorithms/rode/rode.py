@@ -114,7 +114,9 @@ class RODETrainer:
             (1.0 - episode_index / max(1, self.config.epsilon_decay)),
         )
         total_reward = 0.0
+        n_steps = 0
         for _ in range(self.config.episode_limit):
+            n_steps += 1
             obs_tensor = torch.as_tensor(
                 obs, dtype=torch.float32, device=self.device).unsqueeze(0).unsqueeze(0)
             with torch.no_grad():
@@ -137,7 +139,7 @@ class RODETrainer:
             total_reward += next_obs_reward
             if done:
                 break
-        return builder.finish(), total_reward
+        return builder.finish(), total_reward, total_reward / max(1, n_steps)
 
     def _next_hidden(self, obs: torch.Tensor, hidden: torch.Tensor | None):
         batch, _, agents, _ = obs.shape
@@ -183,7 +185,7 @@ class RODETrainer:
 
     def train(self) -> None:
         for episode_index in range(self.config.episodes):
-            episode, reward = self.collect_episode(episode_index)
+            episode, reward, coverage_rate = self.collect_episode(episode_index)
             self.replay.add(episode)
             loss = None
             if len(self.replay) >= max(self.config.warmup_episodes, self.config.batch_size):
@@ -191,7 +193,8 @@ class RODETrainer:
             if (episode_index + 1) % 10 == 0:
                 print(
                     f"episode {episode_index + 1}/{self.config.episodes} | reward {reward:.3f} | loss {loss}", flush=True)
-                self.wandb.log({"reward": reward, "loss": loss if loss is not None else float("nan")},
+                self.wandb.log({"reward": reward, "coverage_rate": coverage_rate,
+                                "loss": loss if loss is not None else float("nan")},
                                step=episode_index + 1)
             if (episode_index + 1) % self.config.target_update_every == 0:
                 self.target.load_state_dict(self.online.state_dict())

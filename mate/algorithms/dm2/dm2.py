@@ -389,7 +389,8 @@ class DM2Trainer:
             "rewards": np.asarray(rew_l, dtype=np.float32)[:, None],  # (T, 1)
             "dones": np.asarray(done_l, dtype=np.float32)[:, None],   # (T, 1)
         })
-        return total
+        n = len(rew_l)
+        return total, total / max(1, n)
 
     def _buffer_tensors(self) -> dict[str, torch.Tensor]:
         """Concatenate buffered episodes along the time axis."""
@@ -514,7 +515,7 @@ class DM2Trainer:
         cfg = self.config
         Path(cfg.outdir).mkdir(parents=True, exist_ok=True)
         for ep in range(cfg.episodes):
-            rt = self.collect_episode(cfg.seed + ep)
+            rt, coverage_rate = self.collect_episode(cfg.seed + ep)
             if len(self._episodes) < cfg.train_after:
                 continue
             if cfg.use_linear_lr_decay:
@@ -528,7 +529,7 @@ class DM2Trainer:
             self._episodes.clear()
             print(f"[dm2] ep={ep} rew={rt:.2f}",
                   {k: round(v, 4) for k, v in info.items()})
-            self.wandb.log({"reward": rt, **info}, step=ep)
+            self.wandb.log({"reward": rt, "coverage_rate": coverage_rate, **info}, step=ep)
             if ep % cfg.save_every == 0:
                 self.save()
 

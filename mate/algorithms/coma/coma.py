@@ -129,7 +129,9 @@ class COMATrainer:
             self.env.n_agents, self.env.obs_shape, self.env.n_actions)
         builder.start(obs, state, self.env.get_avail_actions())
         total_reward = 0.0
+        n_steps = 0
         for _ in range(self.config.episode_limit):
+            n_steps += 1
             obs_tensor = torch.as_tensor(
                 obs, dtype=torch.float32, device=self.device).unsqueeze(0).unsqueeze(0)
             with torch.no_grad():
@@ -148,7 +150,7 @@ class COMATrainer:
             total_reward += reward
             if done:
                 break
-        return builder.finish(), total_reward
+        return builder.finish(), total_reward, total_reward / max(1, n_steps)
 
     def update(self, batch: dict[str, torch.Tensor]) -> tuple[float, float]:
         obs = batch["obs"][:, :-1]
@@ -197,7 +199,7 @@ class COMATrainer:
     def train(self) -> None:
         last_losses = (None, None)
         for episode_index in range(self.config.episodes):
-            episode, reward = self.collect_episode(episode_index)
+            episode, reward, coverage_rate = self.collect_episode(episode_index)
             self.replay.add(episode)
             if (episode_index + 1) % self.config.update_every == 0 and len(self.replay) >= self.config.batch_size:
                 last_losses = self.update(
@@ -207,6 +209,7 @@ class COMATrainer:
                 print(
                     f"episode {episode_index + 1}/{self.config.episodes} | reward {reward:.3f} | actor {actor_l} | critic {critic_l}", flush=True)
                 self.wandb.log({"reward": reward,
+                                "coverage_rate": coverage_rate,
                                 "actor_loss": actor_l if actor_l is not None else float("nan"),
                                 "critic_loss": critic_l if critic_l is not None else float("nan")},
                                step=episode_index + 1)

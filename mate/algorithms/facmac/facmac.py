@@ -189,7 +189,9 @@ class FACMACTrainer:
             self.env.n_agents, self.env.obs_shape, self.env.n_actions)
         builder.start(obs, state, self.env.get_avail_actions())
         total = 0.0
+        n_steps = 0
         for _ in range(self.config.episode_limit):
+            n_steps += 1
             o = torch.as_tensor(obs, dtype=torch.float32, device=self.device)
             with torch.no_grad():
                 act = self.actor.act(o, greedy=False)
@@ -207,7 +209,7 @@ class FACMACTrainer:
             if done:
                 break
         self.replay.add(builder.finish())
-        return total
+        return total, total / max(1, n_steps)
 
     # ----------------------------------------------------------- helpers
     def _onehot(self, actions: torch.Tensor) -> torch.Tensor:
@@ -298,7 +300,7 @@ class FACMACTrainer:
         Path(cfg.outdir).mkdir(parents=True, exist_ok=True)
         env_steps_at_last_learn = 0
         for ep in range(cfg.episodes):
-            total = self.collect_episode(ep)
+            total, coverage_rate = self.collect_episode(ep)
             self._schedule_epsilon()
             if (self._env_steps - env_steps_at_last_learn) >= cfg.update_every \
                     and len(self.replay) >= cfg.batch_size:
@@ -309,7 +311,8 @@ class FACMACTrainer:
                     print(f"[facmac] ep={ep} rew={total:.2f} "
                           f"critic_loss={cl:.3f} pg_loss={pl:.4f} "
                           f"eps={self.epsilon:.2f}")
-                    self.wandb.log({"reward": total, "critic_loss": cl,
+                    self.wandb.log({"reward": total, "coverage_rate": coverage_rate,
+                                    "critic_loss": cl,
                                     "pg_loss": pl, "epsilon": self.epsilon}, step=ep)
             if ep % cfg.save_every == 0:
                 self.save()

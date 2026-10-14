@@ -477,7 +477,9 @@ class DCGTrainer:
         builder.start(obs, state, self.env.get_avail_actions())
         hidden = torch.zeros(self.env.n_agents, self.config.hidden, device=self.device)
         total_reward = 0.0
+        n_steps = 0
         for _ in range(self.config.episode_limit):
+            n_steps += 1
             self._schedule_epsilon()
             obs_t = torch.as_tensor(obs, dtype=torch.float32, device=self.device).unsqueeze(0)
             state_t = torch.as_tensor(state, dtype=torch.float32, device=self.device).unsqueeze(0)
@@ -501,7 +503,7 @@ class DCGTrainer:
             total_reward += reward
             if done:
                 break
-        return builder.finish(), total_reward
+        return builder.finish(), total_reward, total_reward / max(1, n_steps)
 
     # ------------------------------------------------------------ update
 
@@ -569,7 +571,7 @@ class DCGTrainer:
         cfg = self.config
         last_loss: Optional[float] = None
         for episode_index in range(cfg.episodes):
-            episode, reward = self.collect_episode(episode_index)
+            episode, reward, coverage_rate = self.collect_episode(episode_index)
             self.replay.add(episode)
             if (episode_index + 1) % cfg.update_every == 0 and len(self.replay) >= cfg.batch_size:
                 last_loss = self.update(self.replay.sample(cfg.batch_size))
@@ -581,6 +583,7 @@ class DCGTrainer:
                     msg += f" | loss {last_loss:.4f}"
                 print(msg, flush=True)
                 self.wandb.log({"reward": reward,
+                                "coverage_rate": coverage_rate,
                                 "loss": last_loss if last_loss is not None else float("nan")},
                                step=episode_index + 1)
         outdir = Path(cfg.outdir)

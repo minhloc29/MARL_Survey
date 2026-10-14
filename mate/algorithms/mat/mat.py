@@ -218,7 +218,7 @@ class MATTrainer:
             "obs": obs_buffer[:-1], "state": state_buffer[:-1],
             "actions": action_buffer, "old_log_prob": log_prob_buffer,
             "advantages": advantages, "returns": returns,
-        }, episode_reward
+        }, episode_reward, episode_reward / max(1, steps)
 
     def update(self, rollout: dict[str, np.ndarray]) -> tuple[float, float]:
         batch_size = rollout["actions"].shape[0]
@@ -264,12 +264,13 @@ class MATTrainer:
 
     def train(self) -> None:
         for update in range(self.config.updates):
-            rollout, reward = self.collect_rollout()
+            rollout, reward, coverage_rate = self.collect_rollout()
             policy_loss, value_loss = self.update(rollout)
             if (update + 1) % 10 == 0:
                 print(
                     f"update {update + 1}/{self.config.updates} | reward {reward:.3f} | policy {policy_loss:.4f} | value {value_loss:.4f}", flush=True)
-                self.wandb.log({"reward": reward, "policy_loss": policy_loss,
+                self.wandb.log({"reward": reward, "coverage_rate": coverage_rate,
+                                "policy_loss": policy_loss,
                                 "value_loss": value_loss}, step=update + 1)
         output = Path(self.config.outdir)
         output.mkdir(parents=True, exist_ok=True)
