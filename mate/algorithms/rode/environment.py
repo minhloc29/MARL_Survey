@@ -74,8 +74,8 @@ class MateRodeEnv:
         """Reset the Gymnasium environment and return observations and state."""
         self._step_count = 0
         self._obs, _ = self.env.reset(seed=seed)
-        self._obs = self._validate_observation(self._obs)
-        self._state = self._make_state(self._obs)
+        self._obs = self._normalize(self._validate_observation(self._obs))
+        self._state = self._normalize(self._make_state(self._obs))
         return self._obs.copy(), self._state.copy()
 
     def step(self, actions: Any) -> tuple[float, bool, dict[str, Any]]:
@@ -90,8 +90,8 @@ class MateRodeEnv:
             env_actions = self._action_high * self._action_grid[action_array]
         obs, reward, terminated, truncated, info = self.env.step(env_actions)
         self._step_count += 1
-        self._obs = self._validate_observation(obs)
-        self._state = self._make_state(self._obs)
+        self._obs = self._normalize(self._validate_observation(obs))
+        self._state = self._normalize(self._make_state(self._obs))
 
         time_limit = self._step_count >= self.episode_limit
         done = bool(terminated or truncated or time_limit)
@@ -150,6 +150,21 @@ class MateRodeEnv:
                 f"Expected observation shape {expected_shape}, got {array.shape}."
             )
         return array
+
+    @staticmethod
+    def _normalize(array: np.ndarray) -> np.ndarray:
+        """Per-sample feature standardization.
+
+        Raw MATE observations are unnormalized coordinates that vary by up to a
+        few thousand in magnitude, which saturates the Linear/GRU/Tanh input
+        layers of every learner (policy entropy collapses, Q-heads saturate) and
+        breaks training. Standardize each feature across the feature axis (per
+        agent for observations, across the flattened vector for state) so inputs
+        stay in a bounded, zero-mean unit-variance range.
+        """
+        mean = array.mean(axis=-1, keepdims=True)
+        std = array.std(axis=-1, keepdims=True) + 1e-8
+        return (array - mean) / std
 
     @staticmethod
     def _require_reset(value: Optional[np.ndarray]) -> np.ndarray:
