@@ -172,7 +172,7 @@ def _denormalize_maddpq(a_norm: np.ndarray) -> np.ndarray:
 
 
 def add_common_args(parser):
-    parser.add_argument("--algo", choices=["ppo", "mappo", "maddpq", "qmix", "qplex", "rode", "coma", "mat", "dcg", "i2c", "dm2", "facmac"], default="mappo",
+    parser.add_argument("--algo", choices=["ppo", "mappo", "maddpq", "qmix", "qplex", "rode", "coma", "mat", "dcg", "i2c", "dm2", "facmac", "iql"], default="mappo",
                         help="Training algorithm to run.")
     parser.add_argument("--device", type=str, default="cpu",
                         help="Device to run training on: 'auto', 'cuda', 'mps' (Apple Silicon), or 'cpu'.")
@@ -881,6 +881,21 @@ def main():
     parser.add_argument("--facmac-epsilon-start", type=float, default=0.5)
     parser.add_argument("--facmac-epsilon-finish", type=float, default=0.05)
     parser.add_argument("--facmac-outdir", default="ckpts/facmac")
+    parser.add_argument("--iql-config", default="MATE-4v8-9.yaml")
+    parser.add_argument("--iql-levels", type=int, default=3)
+    parser.add_argument("--iql-episode-limit", type=int, default=64)
+    parser.add_argument("--iql-episodes", type=int, default=None)
+    parser.add_argument("--iql-update-every", type=int, default=8)
+    parser.add_argument("--iql-batch-size", type=int, default=8)
+    parser.add_argument("--iql-replay-capacity", type=int, default=128)
+    parser.add_argument("--iql-hidden", type=int, default=128)
+    parser.add_argument("--iql-lr", type=float, default=1e-3)
+    parser.add_argument("--iql-gamma", type=float, default=0.99)
+    parser.add_argument("--iql-target-update-every", type=int, default=10)
+    parser.add_argument("--iql-epsilon-start", type=float, default=1.0)
+    parser.add_argument("--iql-epsilon-end", type=float, default=0.05)
+    parser.add_argument("--iql-epsilon-decay", type=int, default=500)
+    parser.add_argument("--iql-outdir", default="ckpts/iql")
 
     args = parser.parse_args()
     if args.wandb_api is None:
@@ -898,11 +913,13 @@ def main():
     from mate.algorithms.mat import run_mat
     from mate.algorithms.dcg import run_dcg
     from mate.algorithms.i2c import run_i2c
+    from mate.algorithms.iql import run_iql
     dispatcher["rode"] = run_rode
     dispatcher["coma"] = run_coma
     dispatcher["mat"] = run_mat
     dispatcher["dcg"] = run_dcg
     dispatcher["i2c"] = run_i2c
+    dispatcher["iql"] = run_iql
     dispatcher["dm2"] = run_dm2
     dispatcher["facmac"] = run_facmac
     dispatcher[args.algo](args)
