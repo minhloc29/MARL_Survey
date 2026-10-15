@@ -127,8 +127,8 @@ class RODETrainer:
                 hidden = self._next_hidden(obs_tensor, hidden)
                 if builder._rewards.__len__() % self.config.role_interval == 0:
                     roles = role_logits[0, 0].argmax(-1).cpu().numpy()
-                action_values = q_values[0, 0,
-                                         np.arange(self.env.n_agents), roles]
+                action_values = q_values[0, 0, roles,
+                                         np.arange(self.env.n_agents)]
                 actions = action_values.argmax(-1).cpu().numpy()
             if np.random.random() < epsilon:
                 actions = np.random.randint(
