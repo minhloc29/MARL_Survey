@@ -185,8 +185,8 @@ class COMATrainer:
             next_q_taken = next_q.gather(-1,
                                          next_actions.unsqueeze(-1)).squeeze(-1)
             targets = rewards.unsqueeze(-1) + self.config.gamma * (
-                1.0 - terminated.unsqueeze(-1)) * next_q_taken.unsqueeze(-1)
-        critic_loss = (((q_taken - targets.squeeze(-1)) ** 2) *
+                1.0 - terminated.unsqueeze(-1)) * next_q_taken
+        critic_loss = (((q_taken - targets) ** 2) *
                        mask.unsqueeze(-1)).sum() / mask.sum().clamp_min(1.0)
 
         self.actor_optimizer.zero_grad()
