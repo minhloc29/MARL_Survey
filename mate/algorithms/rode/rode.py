@@ -45,7 +45,7 @@ class RODENetwork(nn.Module):
             hidden = hidden.view(batch, agents, -1)
             role_logits.append(self.role_head(hidden))
             outputs.append(torch.einsum("bah,rhk->brak", hidden,
-                           self.role_actions) + self.action_bias)
+                           self.role_actions) + self.action_bias.view(1, self.n_roles, 1, -1))
         return torch.stack(outputs, dim=1), torch.stack(role_logits, dim=1)
 
 
