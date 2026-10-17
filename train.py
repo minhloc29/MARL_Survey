@@ -172,7 +172,7 @@ def _denormalize_maddpq(a_norm: np.ndarray) -> np.ndarray:
 
 
 def add_common_args(parser):
-    parser.add_argument("--algo", choices=["ppo", "mappo", "maddpq", "qmix", "qplex", "rode", "coma", "mat", "dcg", "i2c", "dm2", "facmac", "iql"], default="mappo",
+    parser.add_argument("--algo", choices=["ppo", "mappo", "maddpq", "qmix", "qplex", "rode", "coma", "mat", "dcg", "i2c", "dm2", "facmac", "iql", "aorpo", "mamba", "mambpo"], default="mappo",
                         help="Training algorithm to run.")
     parser.add_argument("--device", type=str, default="cpu",
                         help="Device to run training on: 'auto', 'cuda', 'mps' (Apple Silicon), or 'cpu'.")
@@ -896,6 +896,12 @@ def main():
     parser.add_argument("--iql-epsilon-end", type=float, default=0.05)
     parser.add_argument("--iql-epsilon-decay", type=int, default=500)
     parser.add_argument("--iql-outdir", default="ckpts/iql")
+    from mate.algorithms.aorpo import add_aorpo_args
+    from mate.algorithms.mamba import add_mamba_args
+    from mate.algorithms.mambpo import add_mambpo_args
+    add_aorpo_args(parser)
+    add_mamba_args(parser)
+    add_mambpo_args(parser)
 
     args = parser.parse_args()
     if args.wandb_api is None:
@@ -922,6 +928,12 @@ def main():
     dispatcher["iql"] = run_iql
     dispatcher["dm2"] = run_dm2
     dispatcher["facmac"] = run_facmac
+    from mate.algorithms.aorpo import run_aorpo
+    from mate.algorithms.mamba import run_mamba
+    from mate.algorithms.mambpo import run_mambpo
+    dispatcher["aorpo"] = run_aorpo
+    dispatcher["mamba"] = run_mamba
+    dispatcher["mambpo"] = run_mambpo
     dispatcher[args.algo](args)
 
 
