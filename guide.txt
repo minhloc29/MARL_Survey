@@ -1,4 +1,4 @@
-python train.py --algo dcg --wandb-api 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
+python train.py --algo dcg --wandb-api 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 --dcg-num-envs 16
 
 
 python train.py --algo dm2 --dm2-rew-type mixed --dm2-gail-sil --dm2-update-gail --wandb-api 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

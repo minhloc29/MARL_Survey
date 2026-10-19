@@ -92,6 +92,7 @@ class COMAConfig:
     epsilon: float = 0.05
     device: str = "cpu"
     seed: int = 0
+    num_envs: int = 1
     outdir: str = "ckpts/coma"
     wandb_api: Optional[str] = None
 
@@ -110,6 +111,11 @@ class COMATrainer:
             episode_limit=config.episode_limit,
             render_mode="rgb_array",
         )
+        self.rollout = None
+        if config.num_envs > 1:
+            from mate.algorithms.batched_rollout import BatchedRollout
+            self.rollout = BatchedRollout(
+                lambda: _make_coma_vec_env(config), config.num_envs)
         self.actor = COMAActor(
             self.env.obs_shape, self.env.n_agents, self.env.n_actions, config.hidden
         ).to(self.device)
@@ -124,6 +130,7 @@ class COMATrainer:
         self.replay = RODEEpisodeReplay(config.replay_capacity, self.device)
         self.wandb = WandbLogger("mate-coma", "coma", dict(config.__dict__), config.wandb_api)
         self._env_steps = 0
+        self._batch_episodes = []
 
     def collect_episode(self, episode_index: int):
         obs, state = self.env.reset(seed=self.config.seed + episode_index)
@@ -154,6 +161,75 @@ class COMATrainer:
             if done:
                 break
         return builder.finish(), total_reward, total_reward / max(1, n_steps)
+
+    def batched_act(self, payloads, training):
+        """Compute actions for all slots from their current obs (parent process).
+
+        Mirrors the single-env action logic of ``collect_episode`` (shared
+        ``COMAActor`` forward + Categorical sample + optional epsilon greed).
+        """
+        actions = []
+        for payload in payloads:
+            obs_tensor = torch.as_tensor(
+                payload["obs"], dtype=torch.float32, device=self.device
+            ).unsqueeze(0).unsqueeze(0)
+            with torch.no_grad():
+                logits = self.actor(obs_tensor)[0, 0]
+                act = Categorical(logits=logits).sample()
+            if self.config.epsilon > 0 and np.random.random() < self.config.epsilon:
+                act = torch.randint(
+                    self.env.n_actions, (self.env.n_agents,), device=self.device)
+            actions.append(act.cpu().numpy())
+        return np.stack(actions)
+
+    def collect_batch(self, first_ep):
+        """Concurrently collect ``num_envs`` episodes in parallel workers."""
+        num = self.rollout.num_envs
+        payloads = self.rollout.reset(
+            [self.config.seed + first_ep + i for i in range(num)])
+        builders = [
+            RODEEpisodeBuilder(self.env.n_agents, self.env.obs_shape, self.env.n_actions)
+            for _ in range(num)
+        ]
+        for b, p in zip(builders, payloads):
+            b.start(p["obs"], p["state"], p["avail_actions"])
+        total_rewards = np.zeros(num, dtype=np.float64)
+        n_steps = np.zeros(num, dtype=np.int64)
+        for _ in range(self.config.episode_limit):
+            actions = self.batched_act(payloads, training=True)
+            step = self.rollout.step(actions)
+            for i in range(num):
+                n_steps[i] += 1
+                self._env_steps += 1
+                terminal = step.infos[i].get("final_observation")
+                fin = terminal if step.done[i] else step.obs[i]
+                builders[i].add(
+                    actions[i], float(step.rewards[i]), bool(step.done[i]),
+                    fin["obs"], fin["state"], fin["avail_actions"],
+                )
+                total_rewards[i] += float(step.rewards[i])
+                if step.done[i]:
+                    self._record_episode(builders[i].finish())
+                    # Auto-reset continuation episode: re-seed the builder with the
+                    # post-reset obs so the next add() records the fresh episode's
+                    # first transition (finish() already clears the arrays).
+                    builders[i].start(step.obs[i]["obs"], step.obs[i]["state"],
+                                      step.obs[i]["avail_actions"])
+            payloads = step.obs
+            if all(step.done):
+                break
+        mean = float(total_rewards.mean())
+        avg_steps = float(np.mean(np.maximum(n_steps, 1)))
+        return self._batch_episodes, mean, mean / max(avg_steps, 1e-8)
+
+    def _record_episode(self, episode):
+        """Hook: what to do with a finished episode in the batched path.
+
+        For COMA, episodes accumulate in ``self.replay`` over the outer train
+        loop (same as the single-env path, where ``train()`` calls
+        ``self.replay.add(episode)``).
+        """
+        self._batch_episodes.append(episode)
 
     def update(self, batch: dict[str, torch.Tensor]) -> tuple[float, float]:
         obs = batch["obs"][:, :-1]
@@ -206,7 +282,32 @@ class COMATrainer:
             if (self.config.total_env_steps is not None
                     and self._env_steps >= self.config.total_env_steps):
                 break
-            episode, reward, coverage_rate = self.collect_episode(episode_index)
+            if self.rollout is not None:
+                # Batched path: collect `num_envs` episodes concurrently, then
+                # feed each finished episode through the same replay/update flow.
+                self._batch_episodes = []
+                _, reward, coverage_rate = self.collect_batch(episode_index)
+                step_span = self.rollout.num_envs
+                for idx, episode in enumerate(self._batch_episodes):
+                    self.replay.add(episode)
+                    ep_idx = episode_index + idx
+                    if (ep_idx + 1) % self.config.update_every == 0 and len(self.replay) >= self.config.batch_size:
+                        last_losses = self.update(
+                            self.replay.sample(self.config.batch_size))
+                    if (ep_idx + 1) % 10 == 0:
+                        actor_l, critic_l = last_losses
+                        print(
+                            f"episode {ep_idx + 1}/{self.config.episodes} | reward {reward:.3f} | actor {actor_l} | critic {critic_l}", flush=True)
+                        self.wandb.log({"reward": reward,
+                                        "coverage_rate": coverage_rate,
+                                        "actor_loss": actor_l if actor_l is not None else float("nan"),
+                                        "critic_loss": critic_l if critic_l is not None else float("nan")},
+                                       step=ep_idx + 1)
+                    if (ep_idx + 1) % self.config.target_update_every == 0:
+                        self.target_critic.load_state_dict(self.critic.state_dict())
+                episode_index += step_span
+            else:
+                episode, reward, coverage_rate = self.collect_episode(episode_index)
             self.replay.add(episode)
             if (episode_index + 1) % self.config.update_every == 0 and len(self.replay) >= self.config.batch_size:
                 last_losses = self.update(
@@ -228,6 +329,19 @@ class COMATrainer:
         ), "critic": self.critic.state_dict()}, Path(self.config.outdir) / "latest.pt")
         self.wandb.finish()
         self.env.close()
+        if self.rollout is not None:
+            self.rollout.close()
+
+
+def _make_coma_vec_env(config) -> "MateRodeVecEnv":
+    """Top-level, cloudpickle-safe env factory for the batched rollout worker."""
+    from mate.algorithms.vec_adapter import MateRodeVecEnv
+    env = make_mate_rode_env(
+        config=config.config,
+        levels=config.levels,
+        episode_limit=config.episode_limit,
+    )
+    return MateRodeVecEnv(env)
 
 
 def run_coma(args: Any) -> None:
@@ -245,6 +359,7 @@ def run_coma(args: Any) -> None:
         batch_size=args.coma_batch_size,
         device=args.device,
         seed=args.seed,
+        num_envs=getattr(args, "coma_num_envs", 1),
         outdir=args.coma_outdir,
         wandb_api=args.wandb_api,
     )).train()

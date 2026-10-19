@@ -46,6 +46,7 @@ class AORPOConfig:
     opponent_entropy: float = 0.1
     device: str = "cpu"
     seed: int = 0
+    num_envs: int = 1
     log_every: int = 10
     save_every: int = 100
     outdir: str = "ckpts/aorpo"
@@ -114,6 +115,11 @@ class AORPOTrainer:
         self.model_replays = [TransitionReplay(config.model_capacity, config.seed + 3 + i)
                               for i in range(self.env.n_agents)]
         self.steps = self.episode = self.updates = 0
+        self.rollout = None
+        if config.num_envs > 1:
+            from mate.algorithms.batched_rollout import BatchedRollout
+            self.rollout = BatchedRollout(
+                lambda: _make_aorpo_vec_env(config), config.num_envs)
         if config.resume:
             try:
                 self.load(config.resume)
@@ -165,6 +171,56 @@ class AORPOTrainer:
                 break
         return {"reward": reward_sum, "length": step + 1,
                 "coverage": float(np.mean(coverage)) if coverage else 0.0}
+
+    @torch.no_grad()
+    def batched_act(self, observations, training=True):
+        """Actions for all slots from their obs (parent process). Mirrors
+        ``collect_episode``'s per-agent shared policy + warmup random override."""
+        actions = []
+        for obs in observations:
+            if training and len(self.real_replay) < self.config.warmup:
+                actions.append(self.rng.integers(
+                    self.env.n_actions, size=self.env.n_agents))
+            else:
+                actions.append(self.act(obs, greedy=not training))
+        return np.stack(actions)
+
+    def collect_batch(self, first_ep, training=True):
+        """Concurrently collect ``num_envs`` episodes in parallel workers."""
+        num = self.rollout.num_envs
+        obs_list = self.rollout.reset(
+            [self.config.seed + first_ep + i for i in range(num)])
+        reward_sums = np.zeros(num)
+        lengths = np.zeros(num, dtype=np.int64)
+        coverages = [[] for _ in range(num)]
+        for _ in range(self.config.episode_limit):
+            actions = self.batched_act(obs_list, training=training)
+            step = self.rollout.step(actions)
+            for i in range(num):
+                next_obs = step.obs[i] if not step.done[i] else (
+                    step.infos[i].get("final_observation", step.obs[i]))
+                reward = float(step.rewards[i])
+                terminated = bool(step.done[i])
+                if training:
+                    row = (obs_list[i], actions[i],
+                           np.full(self.env.n_agents, reward), next_obs, terminated)
+                    self.real_replay.add(*row)
+                    destination = self.model_validation if self.steps % 5 == 0 else self.model_train
+                    destination.add(*row)
+                    self.steps += 1
+                reward_sums[i] += reward
+                lengths[i] += 1
+                infos = step.infos[i].get("infos", []) if isinstance(step.infos[i], dict) else []
+                values = [float(item["coverage_rate"]) for item in infos if "coverage_rate" in item]
+                if values:
+                    coverages[i].append(float(np.mean(values)))
+            obs_list = step.obs
+            if all(step.done):
+                break
+        avg_reward = float(reward_sums.mean())
+        avg_cover = float(np.mean([np.mean(c) if c else 0.0 for c in coverages]))
+        avg_len = float(np.mean(lengths))
+        return {"reward": avg_reward, "length": avg_len, "coverage": avg_cover}
 
     @staticmethod
     def _optimize(optimizer, parameters, loss, clip):
@@ -339,9 +395,14 @@ class AORPOTrainer:
                 run = wandb.init(project="mate-aorpo", config=config)
             if self.config.resume:
                 print("Loaded AORPO learner; collecting fresh replay before updates.", flush=True)
-            for index in range(self.episode, self.episode + self.config.episodes):
-                metrics = self.collect_episode(index)
-                self.episode = index + 1
+            end = self.episode + self.config.episodes
+            while self.episode < end:
+                if self.rollout is not None:
+                    metrics = self.collect_batch(self.episode)
+                    self.episode += self.rollout.num_envs
+                else:
+                    metrics = self.collect_episode(self.episode)
+                    self.episode += 1
                 if self.ready:
                     metrics.update(self.update())
                 if self.episode % self.config.log_every == 0:
@@ -356,8 +417,17 @@ class AORPOTrainer:
                 print("No learner updates yet: collect more episodes or reduce warmup.", flush=True)
         finally:
             self.env.close()
+            if self.rollout is not None:
+                self.rollout.close()
             if run is not None:
                 run.finish()
+
+
+def _make_aorpo_vec_env(config) -> "MateCameraVecEnv":
+    """Top-level, cloudpickle-safe env factory for the batched rollout worker."""
+    from mate.algorithms.vec_adapter import MateCameraVecEnv
+    env = DiscreteCameraEnvironment(config.config, config.levels, config.episode_limit)
+    return MateCameraVecEnv(env, continuous=False)
 
 
 def add_aorpo_args(parser):

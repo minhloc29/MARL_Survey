@@ -137,6 +137,7 @@ class MATConfig:
     value_coef: float = 0.5
     device: str = "cpu"
     seed: int = 0
+    num_envs: int = 1
     outdir: str = "ckpts/mat"
     wandb_api: Optional[str] = None
 
@@ -160,6 +161,80 @@ class MATTrainer:
         self.optimizer = torch.optim.Adam(
             self.policy.parameters(), lr=config.lr)
         self.wandb = WandbLogger("mate-mat", "mat", dict(config.__dict__), config.wandb_api)
+        self.rollout = None
+        if config.num_envs > 1:
+            from mate.algorithms.batched_rollout import BatchedRollout
+            self.rollout = BatchedRollout(
+                lambda: _make_mat_vec_env(config), config.num_envs)
+
+    def collect_rollout_batch(self):
+        """Run ``rollout_steps`` concurrent steps across ``num_envs`` slots and
+        return a rollout dict shaped exactly like ``collect_rollout`` but with
+        ``rollout_steps * num_envs`` transitions (auto-reset included)."""
+        steps = self.config.rollout_steps
+        num = self.rollout.num_envs
+        agents, obs_dim, state_dim = self.env.n_agents, self.env.obs_shape, self.env.state_shape
+        obs_buffer = np.zeros((steps + 1, num, agents, obs_dim), dtype=np.float32)
+        state_buffer = np.zeros((steps + 1, num, state_dim), dtype=np.float32)
+        action_buffer = np.zeros((steps, num, agents), dtype=np.int64)
+        log_prob_buffer = np.zeros((steps, num), dtype=np.float32)
+        value_buffer = np.zeros((steps + 1, num), dtype=np.float32)
+        reward_buffer = np.zeros((steps, num), dtype=np.float32)
+        done_buffer = np.zeros((steps, num), dtype=np.float32)
+        payloads = self.rollout.reset([None] * num)
+        episode_reward = 0.0
+        for step in range(steps):
+            for i in range(num):
+                obs_buffer[step, i] = payloads[i]["obs"]
+                state_buffer[step, i] = payloads[i]["state"]
+            obs_tensor = torch.as_tensor(
+                np.stack([p["obs"] for p in payloads]),
+                dtype=torch.float32, device=self.device).unsqueeze(0)  # (1, num, N, O)
+            state_tensor = torch.as_tensor(
+                np.stack([p["state"] for p in payloads]),
+                dtype=torch.float32, device=self.device).unsqueeze(0)  # (1, num, S)
+            with torch.no_grad():
+                actions, log_prob, value = self.policy.sample(obs_tensor, state_tensor)
+            actions_np = actions[0].cpu().numpy()  # (num, agents)
+            step_result = self.rollout.step(actions_np)
+            for i in range(num):
+                action_buffer[step, i] = actions_np[i]
+                log_prob_buffer[step, i] = log_prob[0, i].item()
+                value_buffer[step, i] = value[0, i].item()
+                reward_buffer[step, i] = step_result.rewards[i]
+                done_buffer[step, i] = float(step_result.done[i])
+                episode_reward += float(step_result.rewards[i])
+            payloads = step_result.obs
+        for i in range(num):
+            obs_buffer[-1, i] = payloads[i]["obs"]
+            state_buffer[-1, i] = payloads[i]["state"]
+        with torch.no_grad():
+            _, _, final_value = self.policy.sample(
+                torch.as_tensor(np.stack([p["obs"] for p in payloads]),
+                                dtype=torch.float32, device=self.device).unsqueeze(0),
+                torch.as_tensor(np.stack([p["state"] for p in payloads]),
+                                dtype=torch.float32, device=self.device).unsqueeze(0),
+            )
+        value_buffer[-1] = final_value[0].cpu().numpy()
+
+        # GAE per slot, then flatten (steps, num) -> (steps*num,)
+        adv = np.zeros((steps, num), dtype=np.float32)
+        gae = np.zeros(num, dtype=np.float32)
+        for step in reversed(range(steps)):
+            continuation = 1.0 - done_buffer[step]
+            delta = reward_buffer[step] + self.config.gamma * \
+                value_buffer[step + 1] * continuation - value_buffer[step]
+            gae = delta + self.config.gamma * self.config.gae_lambda * continuation * gae
+            adv[step] = gae
+        returns = adv + value_buffer[:-1]
+        return {
+            "obs": obs_buffer[:-1].reshape(steps * num, agents, obs_dim),
+            "state": state_buffer[:-1].reshape(steps * num, state_dim),
+            "actions": action_buffer.reshape(steps * num, agents),
+            "old_log_prob": log_prob_buffer.reshape(steps * num),
+            "advantages": adv.reshape(steps * num),
+            "returns": returns.reshape(steps * num),
+        }, episode_reward / max(1, num), 0.0
 
     def collect_rollout(self):
         steps = self.config.rollout_steps
@@ -264,7 +339,10 @@ class MATTrainer:
 
     def train(self) -> None:
         for update in range(self.config.updates):
-            rollout, reward, coverage_rate = self.collect_rollout()
+            if self.rollout is not None:
+                rollout, reward, coverage_rate = self.collect_rollout_batch()
+            else:
+                rollout, reward, coverage_rate = self.collect_rollout()
             policy_loss, value_loss = self.update(rollout)
             if (update + 1) % 10 == 0:
                 print(
@@ -278,6 +356,17 @@ class MATTrainer:
                    "config": self.config.__dict__}, output / "latest.pt")
         self.wandb.finish()
         self.env.close()
+        if self.rollout is not None:
+            self.rollout.close()
+
+
+def _make_mat_vec_env(config) -> "MateRodeVecEnv":
+    """Top-level, cloudpickle-safe env factory for the batched rollout worker."""
+    from mate.algorithms.vec_adapter import MateRodeVecEnv
+    env = make_mate_rode_env(
+        config=config.config, levels=config.levels,
+        episode_limit=config.episode_limit)
+    return MateRodeVecEnv(env)
 
 
 def run_mat(args: Any) -> None:
@@ -293,6 +382,7 @@ def run_mat(args: Any) -> None:
         rollout_steps=args.mat_rollout_steps, ppo_epochs=args.mat_ppo_epochs,
         minibatch_size=args.mat_minibatch_size, d_model=args.mat_d_model,
         n_heads=args.mat_n_heads, n_layers=args.mat_n_layers,
-        device=args.device, seed=args.seed, outdir=args.mat_outdir,
+        device=args.device, seed=args.seed, num_envs=getattr(args, "mat_num_envs", 1),
+        outdir=args.mat_outdir,
         wandb_api=args.wandb_api,
     )).train()

@@ -321,6 +321,7 @@ class DM2Config:
     save_every: int = 100
     outdir: str = "ckpts/dm2"
     wandb_api: Optional[str] = None
+    num_envs: int = 1
 
 
 class DM2Trainer:
@@ -364,7 +365,63 @@ class DM2Trainer:
         # on-policy buffer: accumulates episodes until a PPO update
         self._episodes: list[dict[str, np.ndarray]] = []
         self._env_steps = 0
+        self.rollout = None
+        if config.num_envs > 1:
+            from mate.algorithms.batched_rollout import BatchedRollout
+            self.rollout = BatchedRollout(
+                lambda: _make_dm2_vec_env(config), config.num_envs)
         self.wandb = WandbLogger("mate-dm2", "dm2", dict(config.__dict__), config.wandb_api)
+
+    def batched_act(self, payloads):
+        """Actions for all slots from their obs. Mirrors ``collect_episode``:
+        ``DM2Actor.act`` (pure Categorical sample, no epsilon)."""
+        actions = []
+        for payload in payloads:
+            o = torch.as_tensor(payload["obs"], dtype=torch.float32, device=self.device)
+            actions.append(self.actor.act(o).cpu().numpy())
+        return np.stack(actions)
+
+    def collect_batch(self, first_ep):
+        """Concurrently collect ``num_envs`` episodes; append each to the
+        on-policy ``self._episodes`` buffer (same dict keys as single-env)."""
+        num = self.rollout.num_envs
+        payloads = self.rollout.reset(
+            [self.config.seed + first_ep + i for i in range(num)])
+        # per-slot running episode buffers (parallel to self._episodes)
+        cur = [
+            {"obs": [], "actions": [], "rewards": [], "dones": []}
+            for _ in range(num)
+        ]
+        total = np.zeros(num, dtype=np.float64)
+        n_steps = np.zeros(num, dtype=np.int64)
+        for _ in range(self.env.episode_limit):
+            actions = self.batched_act(payloads)
+            step = self.rollout.step(actions)
+            for i in range(num):
+                n_steps[i] += 1
+                self._env_steps += 1
+                cur[i]["actions"].append(actions[i])
+                cur[i]["rewards"].append(float(step.rewards[i]))
+                cur[i]["dones"].append(bool(step.done[i]))
+                # obs* : current obs, incl. post-reset next-obs on done
+                cur[i]["obs"].append(payloads[i]["obs"])
+                total[i] += float(step.rewards[i])
+                if step.done[i]:
+                    self._episodes.append({
+                        "obs": np.asarray(cur[i]["obs"], dtype=np.float32),
+                        "actions": np.asarray(cur[i]["actions"], dtype=np.int64),
+                        "rewards": np.asarray(cur[i]["rewards"], dtype=np.float32)[:, None],
+                        "dones": np.asarray(cur[i]["dones"], dtype=np.float32)[:, None],
+                    })
+                    cur[i] = {"obs": [], "actions": [], "rewards": [], "dones": []}
+                    # first obs of the continuation episode is the post-reset payload
+                    cur[i]["obs"].append(step.obs[i]["obs"])
+            payloads = step.obs
+            if all(step.done):
+                break
+        mean = float(total.mean())
+        avg_steps = float(np.mean(np.maximum(n_steps, 1)))
+        return mean, mean / max(avg_steps, 1e-8)
 
     # ------------------------------------------------------------ data
     def collect_episode(self, seed: int) -> float:
@@ -520,9 +577,13 @@ class DM2Trainer:
             if (cfg.total_env_steps is not None
                     and self._env_steps >= cfg.total_env_steps):
                 break
-            rt, coverage_rate = self.collect_episode(cfg.seed + ep)
-            if len(self._episodes) < cfg.train_after:
+            if self.rollout is not None:
+                rt, coverage_rate = self.collect_batch(ep)
+                ep += self.rollout.num_envs
+            else:
+                rt, coverage_rate = self.collect_episode(cfg.seed + ep)
                 ep += 1
+            if len(self._episodes) < cfg.train_after:
                 continue
             if cfg.use_linear_lr_decay:
                 lr = max(_linear_anneal(cfg.lr, ep, cfg.episodes), 1e-6)
@@ -538,7 +599,6 @@ class DM2Trainer:
             self.wandb.log({"reward": rt, "coverage_rate": coverage_rate, **info}, step=ep)
             if ep % cfg.save_every == 0:
                 self.save()
-            ep += 1
 
     def save(self) -> None:
         out = Path(self.config.outdir)
@@ -557,6 +617,17 @@ class DM2Trainer:
     def close(self) -> None:
         self.wandb.finish()
         self.env.close()
+        if self.rollout is not None:
+            self.rollout.close()
+
+
+def _make_dm2_vec_env(config):
+    """Top-level, cloudpickle-safe env factory for the batched rollout worker."""
+    from mate.algorithms.vec_adapter import MateRodeVecEnv
+    env = make_mate_rode_env(
+        config=config.config, levels=config.levels,
+        episode_limit=config.episode_limit)
+    return MateRodeVecEnv(env)
 
 
 def run_dm2(args: Any) -> None:

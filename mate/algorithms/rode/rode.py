@@ -70,6 +70,7 @@ class RODEConfig:
     epsilon_decay: int = 500
     device: str = "cpu"
     seed: int = 0
+    num_envs: int = 1
     outdir: str = "ckpts/rode"
     wandb_api: Optional[str] = None
 
@@ -102,6 +103,91 @@ class RODETrainer:
         self.wandb = WandbLogger(
             "mate-rode", "rode", dict(config.__dict__), config.wandb_api)
         self._env_steps = 0
+        self._batch_episodes = []
+        self.rollout = None
+        if config.num_envs > 1:
+            from mate.algorithms.batched_rollout import BatchedRollout
+            self.rollout = BatchedRollout(
+                lambda: _make_rode_vec_env(config), config.num_envs)
+
+    def batched_act(self, payloads, hiddens, roles, ep_eps, training=True):
+        """Actions for all slots from their obs + per-slot GRU hidden + roles.
+
+        Mirrors ``collect_episode``: role re-assignment every ``role_interval``
+        steps, role-conditioned argmax actions, and the epsilon override."""
+        n_agents = self.env.n_agents
+        actions = []
+        new_hiddens = []
+        for i, payload in enumerate(payloads):
+            obs_tensor = torch.as_tensor(
+                payload["obs"], dtype=torch.float32, device=self.device
+            ).unsqueeze(0).unsqueeze(0)
+            with torch.no_grad():
+                q_values, role_logits = self.online(obs_tensor, hiddens[i])
+                new_hiddens.append(self._next_hidden(obs_tensor, hiddens[i]))
+                if self._step_counts[i] % self.config.role_interval == 0:
+                    roles[i] = role_logits[0, 0].argmax(-1).cpu().numpy()
+                action_values = q_values[0, 0, roles[i], np.arange(n_agents)]
+                act = action_values.argmax(-1).cpu().numpy()
+            if np.random.random() < ep_eps:
+                act = np.random.randint(
+                    self.env.n_actions, size=n_agents)
+            actions.append(act)
+            self._step_counts[i] += 1
+        return np.stack(actions), new_hiddens
+
+    def collect_batch(self, first_ep):
+        """Concurrently collect ``num_envs`` episodes in parallel workers."""
+        num = self.rollout.num_envs
+        payloads = self.rollout.reset(
+            [self.config.seed + first_ep + i for i in range(num)])
+        builders = [
+            RODEEpisodeBuilder(self.env.n_agents, self.env.obs_shape, self.env.n_actions)
+            for _ in range(num)
+        ]
+        for b, p in zip(builders, payloads):
+            b.start(p["obs"], p["state"], p["avail_actions"])
+        hiddens = [None] * num
+        roles = [np.zeros(self.env.n_agents, dtype=np.int64) for _ in range(num)]
+        self._step_counts = [0] * num
+        total_rewards = np.zeros(num, dtype=np.float64)
+        n_steps = np.zeros(num, dtype=np.int64)
+        ep_eps = max(
+            self.config.epsilon_end,
+            self.config.epsilon_start *
+            (1.0 - first_ep / max(1, self.config.epsilon_decay)),
+        )
+        for _ in range(self.config.episode_limit):
+            actions, hiddens = self.batched_act(payloads, hiddens, roles, ep_eps)
+            step = self.rollout.step(actions)
+            for i in range(num):
+                n_steps[i] += 1
+                self._env_steps += 1
+                terminal = step.infos[i].get("final_observation")
+                fin = terminal if step.done[i] else step.obs[i]
+                builders[i].add(
+                    actions[i], float(step.rewards[i]), bool(step.done[i]),
+                    fin["obs"], fin["state"], fin["avail_actions"], roles[i],
+                )
+                total_rewards[i] += float(step.rewards[i])
+                if step.done[i]:
+                    self._record_episode(builders[i].finish())
+                    # Auto-reset continuation: re-seed builder, reset hidden/roles/counter.
+                    builders[i].start(step.obs[i]["obs"], step.obs[i]["state"],
+                                      step.obs[i]["avail_actions"])
+                    hiddens[i] = None
+                    roles[i] = np.zeros(self.env.n_agents, dtype=np.int64)
+                    self._step_counts[i] = 0
+            payloads = step.obs
+            if all(step.done):
+                break
+        mean = float(total_rewards.mean())
+        avg_steps = float(np.mean(np.maximum(n_steps, 1)))
+        return self._batch_episodes, mean, mean / max(avg_steps, 1e-8)
+
+    def _record_episode(self, episode):
+        """Hook: accumulate finished episodes for the outer train() replay flow."""
+        self._batch_episodes.append(episode)
 
     def collect_episode(self, episode_index: int):
         obs, state = self.env.reset(seed=self.config.seed + episode_index)
@@ -194,26 +280,62 @@ class RODETrainer:
             if (self.config.total_env_steps is not None
                     and self._env_steps >= self.config.total_env_steps):
                 break
-            episode, reward, coverage_rate = self.collect_episode(episode_index)
-            self.replay.add(episode)
-            loss = None
-            if len(self.replay) >= max(self.config.warmup_episodes, self.config.batch_size):
-                loss = self.update(self.replay.sample(self.config.batch_size))
-            if (episode_index + 1) % 10 == 0:
-                print(
-                    f"episode {episode_index + 1}/{self.config.episodes} | reward {reward:.3f} | loss {loss}", flush=True)
-                self.wandb.log({"reward": reward, "coverage_rate": coverage_rate,
-                                "loss": loss if loss is not None else float("nan")},
-                               step=episode_index + 1)
-            if (episode_index + 1) % self.config.target_update_every == 0:
-                self.target.load_state_dict(self.online.state_dict())
-                self.target_mixer.load_state_dict(self.mixer.state_dict())
-            episode_index += 1
+            if self.rollout is not None:
+                # Batched path: collect num_envs episodes concurrently, then run
+                # each finished episode through the same replay/update flow.
+                self._batch_episodes = []
+                _, reward, coverage_rate = self.collect_batch(episode_index)
+                step_span = self.rollout.num_envs
+                for idx, episode in enumerate(self._batch_episodes):
+                    self.replay.add(episode)
+                    ep_idx = episode_index + idx
+                    loss = None
+                    if len(self.replay) >= max(self.config.warmup_episodes, self.config.batch_size):
+                        loss = self.update(self.replay.sample(self.config.batch_size))
+                    if (ep_idx + 1) % 10 == 0:
+                        print(
+                            f"episode {ep_idx + 1}/{self.config.episodes} | reward {reward:.3f} | loss {loss}", flush=True)
+                        self.wandb.log({"reward": reward, "coverage_rate": coverage_rate,
+                                        "loss": loss if loss is not None else float("nan")},
+                                       step=ep_idx + 1)
+                    if (ep_idx + 1) % self.config.target_update_every == 0:
+                        self.target.load_state_dict(self.online.state_dict())
+                        self.target_mixer.load_state_dict(self.mixer.state_dict())
+                episode_index += step_span
+            else:
+                episode, reward, coverage_rate = self.collect_episode(episode_index)
+                self.replay.add(episode)
+                loss = None
+                if len(self.replay) >= max(self.config.warmup_episodes, self.config.batch_size):
+                    loss = self.update(self.replay.sample(self.config.batch_size))
+                if (episode_index + 1) % 10 == 0:
+                    print(
+                        f"episode {episode_index + 1}/{self.config.episodes} | reward {reward:.3f} | loss {loss}", flush=True)
+                    self.wandb.log({"reward": reward, "coverage_rate": coverage_rate,
+                                    "loss": loss if loss is not None else float("nan")},
+                                   step=episode_index + 1)
+                if (episode_index + 1) % self.config.target_update_every == 0:
+                    self.target.load_state_dict(self.online.state_dict())
+                    self.target_mixer.load_state_dict(self.mixer.state_dict())
+                episode_index += 1
         Path(self.config.outdir).mkdir(parents=True, exist_ok=True)
         torch.save({"online": self.online.state_dict(
         ), "mixer": self.mixer.state_dict()}, Path(self.config.outdir) / "latest.pt")
         self.wandb.finish()
         self.env.close()
+        if self.rollout is not None:
+            self.rollout.close()
+
+
+def _make_rode_vec_env(config) -> "MateRodeVecEnv":
+    """Top-level, cloudpickle-safe env factory for the batched rollout worker."""
+    from mate.algorithms.vec_adapter import MateRodeVecEnv
+    env = make_mate_rode_env(
+        config=config.config,
+        levels=config.levels,
+        episode_limit=config.episode_limit,
+    )
+    return MateRodeVecEnv(env)
 
 
 def run_rode(args: Any) -> None:
@@ -235,6 +357,7 @@ def run_rode(args: Any) -> None:
         role_interval=args.rode_role_interval,
         device=args.device,
         seed=args.seed,
+        num_envs=getattr(args, "rode_num_envs", 1),
         outdir=args.rode_outdir,
         wandb_api=args.wandb_api,
     )).train()

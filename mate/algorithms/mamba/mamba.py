@@ -43,6 +43,7 @@ class MAMBAConfig:
     grad_clip: float = 100.0
     device: str = "cpu"
     seed: int = 0
+    num_envs: int = 1
     log_every: int = 10  # episodes
     save_every: int = 100  # episodes
     outdir: str = "ckpts/mamba"
@@ -109,6 +110,11 @@ class MAMBATrainer:
         self.entropy = config.entropy
         self.episode = self.steps = self.updates = 0
         self.model.eval()
+        self.rollout = None
+        if config.num_envs > 1:
+            from mate.algorithms.batched_rollout import BatchedRollout
+            self.rollout = BatchedRollout(
+                lambda: _make_mamba_vec_env(config), config.num_envs)
         if config.resume:
             self.load(config.resume)
 
@@ -148,6 +154,92 @@ class MAMBATrainer:
             self.steps += len(actions)
         return {"reward": float(sum(rewards)), "length": len(actions),
                 "coverage": float(np.mean(coverage)) if coverage else 0.0}
+
+    @torch.no_grad()
+    def batched_act(self, observations, prev_acts, states, training=True):
+        """Actions for all slots from their obs + per-slot RSSM state + previous
+        action (parent process). Mirrors ``collect_episode``'s ``act`` and the
+        warmup random override; returns updated prev_acts and states."""
+        actions, new_prev_acts, new_states = [], [], []
+        for i, obs in enumerate(observations):
+            if training and len(self.replay) < self.config.warmup:
+                action = np.random.randint(self.env.n_actions, size=self.env.n_agents)
+                prev_action = torch.nn.functional.one_hot(
+                    torch.as_tensor(action, device=self.device), self.env.n_actions
+                ).float().unsqueeze(0)
+                state = states[i]
+            else:
+                action, diff_action, state = self.act(
+                    obs, prev_acts[i], states[i], greedy=not training)
+                prev_action = diff_action
+            actions.append(action)
+            new_prev_acts.append(prev_action)
+            new_states.append(state)
+        return np.stack(actions), new_prev_acts, new_states
+
+    def collect_batch(self, first_ep, training=True):
+        """Concurrently collect ``num_envs`` episodes in parallel workers.
+
+        Episodes complete independently per slot (mirroring the single-env
+        path); each finished episode is added to replay via ``SequenceReplay.add``
+        exactly as ``collect_episode`` does (T+1 observations, terminal on the
+        last transition only)."""
+        num = self.rollout.num_envs
+        obs_list = self.rollout.reset(
+            [self.config.seed + first_ep + i for i in range(num)])
+        prev_acts = [None] * num
+        states = [None] * num
+        # per-slot current-episode buffers
+        ep_obs = [[obs_list[i]] for i in range(num)]
+        ep_actions = [[] for _ in range(num)]
+        ep_rewards = [[] for _ in range(num)]
+        ep_terminals = [[] for _ in range(num)]
+        ep_rewards_sum = np.zeros(num)
+        ep_length = np.zeros(num, dtype=np.int64)
+        coverages = [[] for _ in range(num)]
+        n_episodes = [0] * num
+        done = [False] * num
+        for _ in range(self.config.episode_limit):
+            actions, prev_acts, states = self.batched_act(
+                obs_list, prev_acts, states, training=training)
+            step = self.rollout.step(actions)
+            for i in range(num):
+                ep_actions[i].append(actions[i])
+                ep_rewards[i].append(float(step.rewards[i]))
+                ep_terminals[i].append(bool(step.done[i]))
+                ep_rewards_sum[i] += float(step.rewards[i])
+                ep_length[i] += 1
+                infos = step.infos[i].get("infos", []) if isinstance(step.infos[i], dict) else []
+                values = [float(item["coverage_rate"]) for item in infos if "coverage_rate" in item]
+                if values:
+                    coverages[i].append(float(np.mean(values)))
+                if step.done[i]:
+                    # terminal obs for the finished episode, then finalize it
+                    ep = ep_obs[i] + [step.obs[i]]
+                    if training:
+                        # enforce a single terminal boundary at the final step
+                        term = np.asarray(ep_terminals[i], dtype=np.float32)
+                        self.replay.add(ep, ep_actions[i], ep_rewards[i], term)
+                        n_episodes[i] += 1
+                    # start the continuation episode from the post-reset obs
+                    ep_obs[i] = [step.obs[i]]
+                    ep_actions[i] = []
+                    ep_rewards[i] = []
+                    ep_terminals[i] = []
+                    prev_acts[i] = None
+                    states[i] = None
+                else:
+                    ep_obs[i].append(step.obs[i])
+                done[i] = done[i] or step.done[i]
+            obs_list = step.obs
+            if all(done):
+                break
+        if training:
+            self.steps += int(ep_length.sum())
+        reward = float(np.mean([r for r in ep_rewards_sum]))
+        length = float(np.mean([l for l in ep_length]))
+        cov = float(np.mean([np.mean(c) if c else 0.0 for c in coverages]))
+        return {"reward": reward, "length": length, "coverage": cov}
 
     def _optimize(self, optimizer, module, loss):
         if not torch.isfinite(loss):
@@ -234,12 +326,17 @@ class MAMBATrainer:
                 run = wandb.init(project="mate-mamba", config=config)
             if self.config.resume:
                 print("Loaded learner checkpoint; collecting fresh replay before updates.", flush=True)
-            for index in range(self.episode, self.episode + self.config.episodes):
-                metrics = self.collect_episode(index)
+            end = self.episode + self.config.episodes
+            while self.episode < end:
+                if self.rollout is not None:
+                    metrics = self.collect_batch(self.episode)
+                    self.episode += self.rollout.num_envs
+                else:
+                    metrics = self.collect_episode(self.episode)
+                    self.episode += 1
                 if len(self.replay) >= self.config.warmup and self.replay.ready:
                     for _ in range(self.config.updates_per_episode):
                         metrics.update(self.update())
-                self.episode = index + 1
                 if self.episode % self.config.log_every == 0:
                     print(f"mamba episode {self.episode} | steps {self.steps} | updates {self.updates} | "
                           + " | ".join(f"{key} {value:.4f}" for key, value in metrics.items()), flush=True)
@@ -252,8 +349,17 @@ class MAMBATrainer:
                 print("No learner updates yet: increase episodes or reduce warmup/sequence length.", flush=True)
         finally:
             self.env.close()
+            if self.rollout is not None:
+                self.rollout.close()
             if run is not None:
                 run.finish()
+
+
+def _make_mamba_vec_env(config) -> "MateCameraVecEnv":
+    """Top-level, cloudpickle-safe env factory for the batched rollout worker."""
+    from mate.algorithms.vec_adapter import MateCameraVecEnv
+    env = MAMBAEnvironment(config.config, config.levels, config.episode_limit)
+    return MateCameraVecEnv(env, continuous=False)
 
 
 def add_mamba_args(parser):
@@ -261,7 +367,8 @@ def add_mamba_args(parser):
     fields = ("config", "levels", "episode_limit", "episodes", "sequence_length", "batch_size",
               "replay_capacity", "warmup", "updates_per_episode", "horizon", "ppo_epochs", "hidden",
               "categoricals", "classes", "model_lr", "actor_lr", "critic_lr", "gamma", "lambda_",
-              "entropy", "entropy_decay", "grad_clip", "log_every", "save_every", "outdir")
+              "entropy", "entropy_decay", "grad_clip", "log_every", "save_every", "outdir",
+              "num_envs")
     group = parser.add_argument_group("MAMBA")
     for name in fields:
         default = getattr(defaults, name)

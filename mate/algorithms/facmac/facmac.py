@@ -148,6 +148,7 @@ class FACMACConfig:
     save_every: int = 1000
     outdir: str = "ckpts/facmac"
     wandb_api: Optional[str] = None
+    num_envs: int = 1
 
 
 class FACMACTrainer:
@@ -163,6 +164,10 @@ class FACMACTrainer:
             episode_limit=config.episode_limit, render_mode="rgb_array")
         n, obs, na = self.env.n_agents, self.env.obs_shape, self.env.n_actions
         self.n_agents, self.obs_shape, self.n_actions = n, obs, na
+        self.rollout = None
+        if config.num_envs > 1:
+            from mate.algorithms.batched_rollout import BatchedRollout
+            self.rollout = BatchedRollout(lambda: _make_facmac_vec_env(config), config.num_envs)
 
         self.actor = GumbelActor(obs, na, config.hidden).to(self.device)
         self.target_actor = copy.deepcopy(self.actor).to(self.device)
@@ -211,6 +216,54 @@ class FACMACTrainer:
                 break
         self.replay.add(builder.finish())
         return total, total / max(1, n_steps)
+
+    def batched_act(self, payloads):
+        """Compute actions for all parallel slots (parent process). Mirrors
+        ``collect_episode``'s GumbelActor + epsilon logic, looped per env."""
+        actions = []
+        for payload in payloads:
+            o = torch.as_tensor(payload["obs"], dtype=torch.float32, device=self.device)
+            with torch.no_grad():
+                act = self.actor.act(o, greedy=False)
+            if self.epsilon > 0 and np.random.random() < self.epsilon:
+                act = torch.randint(self.n_actions, (self.n_agents,), device=self.device)
+            actions.append(act.cpu().numpy())
+        return np.stack(actions)
+
+    def collect_batch(self, first_ep):
+        """Concurrently collect ``num_envs`` episodes; add each to replay."""
+        num = self.rollout.num_envs
+        payloads = self.rollout.reset(
+            [self.config.seed + first_ep + i for i in range(num)])
+        builders = [RODEEpisodeBuilder(self.n_agents, self.obs_shape, self.n_actions)
+                    for _ in range(num)]
+        for b, p in zip(builders, payloads):
+            b.start(p["obs"], p["state"], p["avail_actions"])
+        total = np.zeros(num, dtype=np.float64)
+        n_steps = np.zeros(num, dtype=np.int64)
+        for _ in range(self.config.episode_limit):
+            actions = self.batched_act(payloads)
+            step = self.rollout.step(actions)
+            for i in range(num):
+                n_steps[i] += 1
+                self._env_steps += 1
+                terminal = step.infos[i].get("final_observation")
+                fin = terminal if step.done[i] else step.obs[i]
+                builders[i].add(actions[i], float(step.rewards[i]), bool(step.done[i]),
+                                fin["obs"], fin["state"], fin["avail_actions"])
+                total[i] += float(step.rewards[i])
+                if step.done[i]:
+                    self.replay.add(builders[i].finish())
+                    # Auto-reset continuation: re-seed the builder with the
+                    # post-reset obs for the fresh episode's first transition.
+                    builders[i].start(step.obs[i]["obs"], step.obs[i]["state"],
+                                      step.obs[i]["avail_actions"])
+            payloads = step.obs
+            if all(step.done):
+                break
+        mean = float(total.mean())
+        avg_steps = float(np.mean(np.maximum(n_steps, 1)))
+        return mean, mean / max(avg_steps, 1e-8)
 
     # ----------------------------------------------------------- helpers
     def _onehot(self, actions: torch.Tensor) -> torch.Tensor:
@@ -305,7 +358,12 @@ class FACMACTrainer:
             if (cfg.total_env_steps is not None
                     and self._env_steps >= cfg.total_env_steps):
                 break
-            total, coverage_rate = self.collect_episode(ep)
+            if self.rollout is not None:
+                total, coverage_rate = self.collect_batch(ep)
+                ep += self.rollout.num_envs
+            else:
+                total, coverage_rate = self.collect_episode(ep)
+                ep += 1
             self._schedule_epsilon()
             if (self._env_steps - env_steps_at_last_learn) >= cfg.update_every \
                     and len(self.replay) >= cfg.batch_size:
@@ -321,7 +379,6 @@ class FACMACTrainer:
                                     "pg_loss": pl, "epsilon": self.epsilon}, step=ep)
             if ep % cfg.save_every == 0:
                 self.save()
-            ep += 1
 
     def save(self) -> None:
         out = Path(self.config.outdir)
@@ -336,6 +393,8 @@ class FACMACTrainer:
     def close(self) -> None:
         self.wandb.finish()
         self.env.close()
+        if self.rollout is not None:
+            self.rollout.close()
 
     def evaluate(self, n_episodes: int = 10) -> float:
         """Mean undiscounted return under the greedy policy (no exploration)."""
@@ -356,6 +415,14 @@ class FACMACTrainer:
             total += ep_rew
         self.actor.train()
         return total / max(n_episodes, 1)
+
+
+def _make_facmac_vec_env(config):
+    """Top-level, cloudpickle-safe env factory for the batched rollout worker."""
+    from mate.algorithms.vec_adapter import MateRodeVecEnv
+    return MateRodeVecEnv(make_mate_rode_env(
+        config=config.config, levels=config.levels,
+        episode_limit=config.episode_limit))
 
 
 def run_facmac(args: Any) -> None:

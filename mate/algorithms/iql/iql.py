@@ -68,6 +68,7 @@ class IQLConfig:
     epsilon_decay: int = 500
     device: str = "cpu"
     seed: int = 0
+    num_envs: int = 1
     outdir: str = "ckpts/iql"
     wandb_api: Optional[str] = None
 
@@ -94,6 +95,71 @@ class IQLTrainer:
         self.replay = RODEEpisodeReplay(config.replay_capacity, self.device)
         self.wandb = WandbLogger("mate-iql", "iql", dict(config.__dict__), config.wandb_api)
         self._env_steps = 0
+        self._batch_episodes = []
+        self.rollout = None
+        if config.num_envs > 1:
+            from mate.algorithms.batched_rollout import BatchedRollout
+            self.rollout = BatchedRollout(
+                lambda: _make_iql_vec_env(config), config.num_envs)
+
+    def batched_act(self, payloads, base_ep):
+        """Actions for all slots from their obs (parent process). Mirrors
+        ``collect_episode``'s greedy Q-network + per-episode epsilon."""
+        actions = []
+        for i, payload in enumerate(payloads):
+            obs_tensor = torch.as_tensor(
+                payload["obs"], dtype=torch.float32, device=self.device
+            ).unsqueeze(0).unsqueeze(0)
+            with torch.no_grad():
+                q_values = self.online(obs_tensor)[0, 0]
+                act = q_values.argmax(-1)
+            if np.random.random() < self._epsilon(base_ep + i):
+                act = torch.randint(
+                    self.env.n_actions, (self.env.n_agents,), device=self.device)
+            actions.append(act.cpu().numpy())
+        return np.stack(actions)
+
+    def collect_batch(self, first_ep):
+        """Concurrently collect ``num_envs`` episodes in parallel workers."""
+        num = self.rollout.num_envs
+        payloads = self.rollout.reset(
+            [self.config.seed + first_ep + i for i in range(num)])
+        builders = [
+            RODEEpisodeBuilder(self.env.n_agents, self.env.obs_shape, self.env.n_actions)
+            for _ in range(num)
+        ]
+        for b, p in zip(builders, payloads):
+            b.start(p["obs"], p["state"], p["avail_actions"])
+        total_rewards = np.zeros(num, dtype=np.float64)
+        n_steps = np.zeros(num, dtype=np.int64)
+        for _ in range(self.config.episode_limit):
+            actions = self.batched_act(payloads, first_ep)
+            step = self.rollout.step(actions)
+            for i in range(num):
+                n_steps[i] += 1
+                self._env_steps += 1
+                terminal = step.infos[i].get("final_observation")
+                fin = terminal if step.done[i] else step.obs[i]
+                builders[i].add(
+                    actions[i], float(step.rewards[i]), bool(step.done[i]),
+                    fin["obs"], fin["state"], fin["avail_actions"],
+                )
+                total_rewards[i] += float(step.rewards[i])
+                if step.done[i]:
+                    self._record_episode(builders[i].finish())
+                    # Auto-reset continuation: re-seed builder for fresh episode.
+                    builders[i].start(step.obs[i]["obs"], step.obs[i]["state"],
+                                      step.obs[i]["avail_actions"])
+            payloads = step.obs
+            if all(step.done):
+                break
+        mean = float(total_rewards.mean())
+        avg_steps = float(np.mean(np.maximum(n_steps, 1)))
+        return self._batch_episodes, mean, mean / max(avg_steps, 1e-8)
+
+    def _record_episode(self, episode):
+        """Hook: accumulate finished episodes for the outer train() replay/update flow."""
+        self._batch_episodes.append(episode)
 
     def collect_episode(self, episode_index: int):
         obs, state = self.env.reset(seed=self.config.seed + episode_index)
@@ -161,24 +227,59 @@ class IQLTrainer:
             if (self.config.total_env_steps is not None
                     and self._env_steps >= self.config.total_env_steps):
                 break
-            episode, reward, coverage_rate = self.collect_episode(episode_index)
-            self.replay.add(episode)
-            if (episode_index + 1) % self.config.update_every == 0 and len(self.replay) >= self.config.batch_size:
-                last_loss = self.update(self.replay.sample(self.config.batch_size))
-            if (episode_index + 1) % 10 == 0:
-                print(
-                    f"episode {episode_index + 1}/{self.config.episodes} | reward {reward:.3f} | loss {last_loss}", flush=True)
-                self.wandb.log({"reward": reward,
-                                "coverage_rate": coverage_rate,
-                                "loss": last_loss if last_loss is not None else float("nan")},
-                               step=episode_index + 1)
-            if (episode_index + 1) % self.config.target_update_every == 0:
-                self.target.load_state_dict(self.online.state_dict())
-            episode_index += 1
+            if self.rollout is not None:
+                # Batched path: collect num_envs episodes concurrently, then run
+                # each finished episode through the same replay/update flow.
+                self._batch_episodes = []
+                _, reward, coverage_rate = self.collect_batch(episode_index)
+                step_span = self.rollout.num_envs
+                for idx, episode in enumerate(self._batch_episodes):
+                    self.replay.add(episode)
+                    ep_idx = episode_index + idx
+                    if (ep_idx + 1) % self.config.update_every == 0 and len(self.replay) >= self.config.batch_size:
+                        last_loss = self.update(self.replay.sample(self.config.batch_size))
+                    if (ep_idx + 1) % 10 == 0:
+                        print(
+                            f"episode {ep_idx + 1}/{self.config.episodes} | reward {reward:.3f} | loss {last_loss}", flush=True)
+                        self.wandb.log({"reward": reward,
+                                        "coverage_rate": coverage_rate,
+                                        "loss": last_loss if last_loss is not None else float("nan")},
+                                       step=ep_idx + 1)
+                    if (ep_idx + 1) % self.config.target_update_every == 0:
+                        self.target.load_state_dict(self.online.state_dict())
+                episode_index += step_span
+            else:
+                episode, reward, coverage_rate = self.collect_episode(episode_index)
+                self.replay.add(episode)
+                if (episode_index + 1) % self.config.update_every == 0 and len(self.replay) >= self.config.batch_size:
+                    last_loss = self.update(self.replay.sample(self.config.batch_size))
+                if (episode_index + 1) % 10 == 0:
+                    print(
+                        f"episode {episode_index + 1}/{self.config.episodes} | reward {reward:.3f} | loss {last_loss}", flush=True)
+                    self.wandb.log({"reward": reward,
+                                    "coverage_rate": coverage_rate,
+                                    "loss": last_loss if last_loss is not None else float("nan")},
+                                   step=episode_index + 1)
+                if (episode_index + 1) % self.config.target_update_every == 0:
+                    self.target.load_state_dict(self.online.state_dict())
+                episode_index += 1
         Path(self.config.outdir).mkdir(parents=True, exist_ok=True)
         torch.save({"online": self.online.state_dict()}, Path(self.config.outdir) / "latest.pt")
         self.wandb.finish()
         self.env.close()
+        if self.rollout is not None:
+            self.rollout.close()
+
+
+def _make_iql_vec_env(config) -> "MateRodeVecEnv":
+    """Top-level, cloudpickle-safe env factory for the batched rollout worker."""
+    from mate.algorithms.vec_adapter import MateRodeVecEnv
+    env = make_mate_rode_env(
+        config=config.config,
+        levels=config.levels,
+        episode_limit=config.episode_limit,
+    )
+    return MateRodeVecEnv(env)
 
 
 def run_iql(args: Any) -> None:
@@ -204,6 +305,7 @@ def run_iql(args: Any) -> None:
         epsilon_decay=args.iql_epsilon_decay,
         device=args.device,
         seed=args.seed,
+        num_envs=getattr(args, "iql_num_envs", 1),
         outdir=args.iql_outdir,
         wandb_api=args.wandb_api,
     )).train()

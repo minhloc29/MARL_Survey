@@ -204,6 +204,7 @@ class I2CConfig:
     grad_norm_clip: float = 10.0
     device: str = "cpu"
     seed: int = 0
+    num_envs: int = 1
     outdir: str = "ckpts/i2c"
     wandb_api: Optional[str] = None
 
@@ -237,6 +238,71 @@ class I2CTrainer:
         self.replay = RODEEpisodeReplay(config.replay_capacity, self.device)
         self.wandb = WandbLogger("mate-i2c", "i2c", dict(config.__dict__), config.wandb_api)
         self._env_steps = 0
+        self._batch_episodes = []
+        self.rollout = None
+        if config.num_envs > 1:
+            from mate.algorithms.batched_rollout import BatchedRollout
+            self.rollout = BatchedRollout(
+                lambda: _make_i2c_vec_env(config), config.num_envs)
+
+    def batched_act(self, payloads, training=True):
+        """Actions for all slots from their obs (parent process). Mirrors
+        ``collect_episode``'s I2CPolicy Categorical sample + epsilon greed."""
+        actions = []
+        for payload in payloads:
+            obs_t = torch.as_tensor(
+                payload["obs"], dtype=torch.float32, device=self.device
+            ).unsqueeze(0)
+            with torch.no_grad():
+                logits, _ = self.actor(obs_t)
+                act = Categorical(logits=logits).sample()[0]
+            if self.config.epsilon > 0 and np.random.random() < self.config.epsilon:
+                act = torch.randint(
+                    0, self.env.n_actions, (self.env.n_agents,), device=self.device)
+            actions.append(act.cpu().numpy())
+        return np.stack(actions)
+
+    def collect_batch(self, first_ep):
+        """Concurrently collect ``num_envs`` episodes in parallel workers."""
+        num = self.rollout.num_envs
+        payloads = self.rollout.reset(
+            [self.config.seed + first_ep + i for i in range(num)])
+        builders = [
+            RODEEpisodeBuilder(self.env.n_agents, self.env.obs_shape, self.env.n_actions)
+            for _ in range(num)
+        ]
+        for b, p in zip(builders, payloads):
+            b.start(p["obs"], p["state"], p["avail_actions"])
+        total_rewards = np.zeros(num, dtype=np.float64)
+        n_steps = np.zeros(num, dtype=np.int64)
+        for _ in range(self.config.episode_limit):
+            actions = self.batched_act(payloads)
+            step = self.rollout.step(actions)
+            for i in range(num):
+                n_steps[i] += 1
+                self._env_steps += 1
+                terminal = step.infos[i].get("final_observation")
+                fin = terminal if step.done[i] else step.obs[i]
+                builders[i].add(
+                    actions[i], float(step.rewards[i]), bool(step.done[i]),
+                    fin["obs"], fin["state"], fin["avail_actions"],
+                )
+                total_rewards[i] += float(step.rewards[i])
+                if step.done[i]:
+                    self._record_episode(builders[i].finish())
+                    # Auto-reset continuation: re-seed builder for fresh episode.
+                    builders[i].start(step.obs[i]["obs"], step.obs[i]["state"],
+                                      step.obs[i]["avail_actions"])
+            payloads = step.obs
+            if all(step.done):
+                break
+        mean = float(total_rewards.mean())
+        avg_steps = float(np.mean(np.maximum(n_steps, 1)))
+        return self._batch_episodes, mean, mean / max(avg_steps, 1e-8)
+
+    def _record_episode(self, episode):
+        """Hook: accumulate finished episodes for the outer train() replay/update flow."""
+        self._batch_episodes.append(episode)
 
     # ------------------------------------------------------------ collection
 
@@ -387,28 +453,65 @@ class I2CTrainer:
             if (cfg.total_env_steps is not None
                     and self._env_steps >= cfg.total_env_steps):
                 break
-            episode, reward, coverage_rate = self.collect_episode(episode_index)
-            self.replay.add(episode)
-            if (episode_index + 1) % cfg.update_every == 0 and len(self.replay) >= cfg.batch_size:
-                last = self.update(self.replay.sample(cfg.batch_size))
-            if (episode_index + 1) % 10 == 0:
-                msg = f"episode {episode_index + 1}/{cfg.episodes} | reward {reward:.3f}"
-                if last[0] is not None:
-                    msg += (f" | actor {last[0]:.4f} | critic {last[1]:.4f} | blz {last[2]:.4f}")
-                print(msg, flush=True)
-                self.wandb.log({"reward": reward,
-                                "coverage_rate": coverage_rate,
-                                "actor_loss": last[0] if last[0] is not None else float("nan"),
-                                "critic_loss": last[1] if last[1] is not None else float("nan"),
-                                "blz": last[2] if last[2] is not None else float("nan")},
-                               step=episode_index + 1)
-            episode_index += 1
+            if self.rollout is not None:
+                # Batched path: collect num_envs episodes concurrently, then run
+                # each finished episode through the same replay/update flow.
+                self._batch_episodes = []
+                _, reward, coverage_rate = self.collect_batch(episode_index)
+                step_span = self.rollout.num_envs
+                for idx, episode in enumerate(self._batch_episodes):
+                    self.replay.add(episode)
+                    ep_idx = episode_index + idx
+                    if (ep_idx + 1) % cfg.update_every == 0 and len(self.replay) >= cfg.batch_size:
+                        last = self.update(self.replay.sample(cfg.batch_size))
+                    if (ep_idx + 1) % 10 == 0:
+                        msg = f"episode {ep_idx + 1}/{cfg.episodes} | reward {reward:.3f}"
+                        if last[0] is not None:
+                            msg += (f" | actor {last[0]:.4f} | critic {last[1]:.4f} | blz {last[2]:.4f}")
+                        print(msg, flush=True)
+                        self.wandb.log({"reward": reward,
+                                        "coverage_rate": coverage_rate,
+                                        "actor_loss": last[0] if last[0] is not None else float("nan"),
+                                        "critic_loss": last[1] if last[1] is not None else float("nan"),
+                                        "blz": last[2] if last[2] is not None else float("nan")},
+                                       step=ep_idx + 1)
+                episode_index += step_span
+            else:
+                episode, reward, coverage_rate = self.collect_episode(episode_index)
+                self.replay.add(episode)
+                if (episode_index + 1) % cfg.update_every == 0 and len(self.replay) >= cfg.batch_size:
+                    last = self.update(self.replay.sample(cfg.batch_size))
+                if (episode_index + 1) % 10 == 0:
+                    msg = f"episode {episode_index + 1}/{cfg.episodes} | reward {reward:.3f}"
+                    if last[0] is not None:
+                        msg += (f" | actor {last[0]:.4f} | critic {last[1]:.4f} | blz {last[2]:.4f}")
+                    print(msg, flush=True)
+                    self.wandb.log({"reward": reward,
+                                    "coverage_rate": coverage_rate,
+                                    "actor_loss": last[0] if last[0] is not None else float("nan"),
+                                    "critic_loss": last[1] if last[1] is not None else float("nan"),
+                                    "blz": last[2] if last[2] is not None else float("nan")},
+                                   step=episode_index + 1)
+                episode_index += 1
         outdir = Path(cfg.outdir)
         outdir.mkdir(parents=True, exist_ok=True)
         torch.save({"actor": self.actor.state_dict(), "critic": self.critic.state_dict(),
                     "config": cfg.__dict__}, outdir / "latest.pt")
         self.wandb.finish()
         self.env.close()
+        if self.rollout is not None:
+            self.rollout.close()
+
+
+def _make_i2c_vec_env(config) -> "MateRodeVecEnv":
+    """Top-level, cloudpickle-safe env factory for the batched rollout worker."""
+    from mate.algorithms.vec_adapter import MateRodeVecEnv
+    env = make_mate_rode_env(
+        config=config.config,
+        levels=config.levels,
+        episode_limit=config.episode_limit,
+    )
+    return MateRodeVecEnv(env)
 
 
 def run_i2c(args: Any) -> None:
@@ -434,6 +537,7 @@ def run_i2c(args: Any) -> None:
         critic_lr=args.i2c_critic_lr,
         device=args.device,
         seed=args.seed,
+        num_envs=getattr(args, "i2c_num_envs", 1),
         outdir=args.i2c_outdir,
         wandb_api=args.wandb_api,
     )).train()

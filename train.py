@@ -717,6 +717,7 @@ def run_dm2(args):
         gamma=args.dm2_gamma, gae_lambda=args.dm2_gae_lambda,
         device=args.device, seed=args.seed, outdir=args.dm2_outdir,
         wandb_api=args.wandb_api,
+        num_envs=getattr(args, "dm2_num_envs", 1),
     )
     DM2Trainer(cfg).train()
 
@@ -738,7 +739,7 @@ def run_facmac(args):
         target_update_interval=args.facmac_target_update_interval,
         epsilon_start=args.facmac_epsilon_start, epsilon_finish=args.facmac_epsilon_finish,
         device=args.device, seed=args.seed, outdir=args.facmac_outdir,
-        wandb_api=args.wandb_api,
+        wandb_api=args.wandb_api, num_envs=getattr(args, "facmac_num_envs", 1),
     )
     FACMACTrainer(cfg).train()
 
@@ -795,12 +796,16 @@ def main():
     parser.add_argument("--rode-n-roles", type=int, default=3)
     parser.add_argument("--rode-role-interval", type=int, default=5)
     parser.add_argument("--rode-outdir", default="ckpts/rode")
+    parser.add_argument("--rode-num-envs", type=int, default=1,
+                        help="Number of parallel env processes for rollouts (>1 enables batched collection).")
     parser.add_argument("--coma-config", default="MATE-4v8-9.yaml")
     parser.add_argument("--coma-levels", type=int, default=3)
     parser.add_argument("--coma-episode-limit", type=int, default=64)
     parser.add_argument("--coma-episodes", type=int, default=None)
     parser.add_argument("--coma-update-every", type=int, default=8)
     parser.add_argument("--coma-batch-size", type=int, default=8)
+    parser.add_argument("--coma-num-envs", type=int, default=1,
+                        help="Number of parallel env processes for rollouts (>1 enables batched collection).")
     parser.add_argument("--coma-outdir", default="ckpts/coma")
     parser.add_argument("--mat-config", default="MATE-4v8-9.yaml")
     parser.add_argument("--mat-levels", type=int, default=3)
@@ -813,6 +818,8 @@ def main():
     parser.add_argument("--mat-n-heads", type=int, default=4)
     parser.add_argument("--mat-n-layers", type=int, default=2)
     parser.add_argument("--mat-outdir", default="ckpts/mat")
+    parser.add_argument("--mat-num-envs", type=int, default=1,
+                        help="Number of parallel env processes for rollouts (>1 multiplies transitions per update).")
     parser.add_argument("--dcg-config", default="MATE-4v8-9.yaml")
     parser.add_argument("--dcg-levels", type=int, default=3)
     parser.add_argument("--dcg-episode-limit", type=int, default=64)
@@ -826,6 +833,8 @@ def main():
     parser.add_argument("--dcg-msg-iterations", type=int, default=8)
     parser.add_argument("--dcg-lr", type=float, default=5e-4)
     parser.add_argument("--dcg-outdir", default="ckpts/dcg")
+    parser.add_argument("--dcg-num-envs", type=int, default=1,
+                        help="Number of parallel env processes for rollouts (>1 enables batched collection).")
     parser.add_argument("--i2c-config", default="MATE-4v8-9.yaml")
     parser.add_argument("--i2c-levels", type=int, default=3)
     parser.add_argument("--i2c-episode-limit", type=int, default=64)
@@ -840,6 +849,8 @@ def main():
     parser.add_argument("--i2c-actor-lr", type=float, default=1e-4)
     parser.add_argument("--i2c-critic-lr", type=float, default=1e-3)
     parser.add_argument("--i2c-outdir", default="ckpts/i2c")
+    parser.add_argument("--i2c-num-envs", type=int, default=1,
+                        help="Number of parallel env processes for rollouts (>1 enables batched collection).")
     parser.add_argument("--dm2-config", default="MATE-4v8-9.yaml")
     parser.add_argument("--dm2-levels", type=int, default=3)
     parser.add_argument("--dm2-episode-limit", type=int, default=64)
@@ -865,6 +876,8 @@ def main():
     parser.add_argument("--dm2-gamma", type=float, default=0.99)
     parser.add_argument("--dm2-gae-lambda", type=float, default=0.95)
     parser.add_argument("--dm2-outdir", default="ckpts/dm2")
+    parser.add_argument("--dm2-num-envs", type=int, default=1,
+                        help="Number of parallel env processes for rollouts (>1 enables batched collection).")
     parser.add_argument("--facmac-config", default="MATE-4v8-9.yaml")
     parser.add_argument("--facmac-levels", type=int, default=3)
     parser.add_argument("--facmac-episode-limit", type=int, default=64)
@@ -876,6 +889,8 @@ def main():
     parser.add_argument("--facmac-td-lambda", type=float, default=0.8)
     parser.add_argument("--facmac-batch-size", type=int, default=32)
     parser.add_argument("--facmac-buffer-size", type=int, default=5000)
+    parser.add_argument("--facmac-num-envs", type=int, default=1,
+                        help="Number of parallel env processes for rollouts (>1 enables batched collection).")
     parser.add_argument("--facmac-gumbel-tau", type=float, default=1.0)
     parser.add_argument("--facmac-target-update-interval", type=int, default=200)
     parser.add_argument("--facmac-epsilon-start", type=float, default=0.5)
@@ -896,6 +911,8 @@ def main():
     parser.add_argument("--iql-epsilon-end", type=float, default=0.05)
     parser.add_argument("--iql-epsilon-decay", type=int, default=500)
     parser.add_argument("--iql-outdir", default="ckpts/iql")
+    parser.add_argument("--iql-num-envs", type=int, default=1,
+                        help="Number of parallel env processes for rollouts (>1 enables batched collection).")
     from mate.algorithms.aorpo import add_aorpo_args
     from mate.algorithms.mamba import add_mamba_args
     from mate.algorithms.mambpo import add_mambpo_args
