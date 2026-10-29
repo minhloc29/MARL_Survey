@@ -426,6 +426,9 @@ class DCGConfig:
     seed: int = 0
     num_envs: int = 1
     outdir: str = "ckpts/dcg"
+    save_every: int = 50          # episodes between periodic checkpoint saves
+    resume: Optional[str] = None  # path to a checkpoint file to resume from
+    resume_steps: bool = True     # restore the env-step counter on resume
     wandb_api: Optional[str] = None
 
 
@@ -462,6 +465,7 @@ class DCGTrainer:
         self.replay = RODEEpisodeReplay(config.replay_capacity, self.device)
         self.epsilon = config.epsilon_start
         self._env_steps = 0
+        self._episode_index = 0
         self._batch_episodes = []
         self.rollout = None
         if config.num_envs > 1:
@@ -469,6 +473,42 @@ class DCGTrainer:
             self.rollout = BatchedRollout(
                 lambda: _make_dcg_vec_env(config), config.num_envs)
         self.wandb = WandbLogger("mate-dcg", "dcg", dict(config.__dict__), config.wandb_api)
+        self._resume()
+
+    # -------------------------------------------------- checkpointing
+
+    def _checkpoint_state(self) -> dict:
+        return {
+            "network": self.network.state_dict(),
+            "config": self.config.__dict__,
+            "env_steps": self._env_steps,
+            "episode_index": self._episode_index,
+        }
+
+    def _resume(self) -> None:
+        """Restore the online network (+ mirror to target) and counters from a checkpoint."""
+        ckpt_path = self.config.resume
+        if not ckpt_path:
+            return
+        ckpt = torch.load(Path(ckpt_path), map_location=self.device)
+        state = ckpt.get("network", ckpt)
+        self.network.load_state_dict(state)
+        self.target_network.load_state_dict(state)
+        self._env_steps = int(ckpt.get("env_steps", 0)) if self.config.resume_steps else 0
+        self._episode_index = int(ckpt.get("episode_index", 0))
+        print(f"[dcg] resumed from {ckpt_path} at env_steps={self._env_steps} "
+              f"episode={self._episode_index}", flush=True)
+
+    def _save_checkpoint(self, path) -> None:
+        """Write current weights/counters to disk and push to W&B (best-effort)."""
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(self._checkpoint_state(), path)
+        if self.wandb.active:
+            try:
+                self.wandb.save(path)
+            except Exception as exc:  # never block training on W&B failures
+                print(f"[wandb] checkpoint upload failed: {exc}", flush=True)
 
     def batched_act(self, payloads, hiddens, training=True):
         """Actions for all slots from their obs + per-slot GRU hidden (parent).
@@ -649,7 +689,7 @@ class DCGTrainer:
     def train(self) -> None:
         cfg = self.config
         last_loss: Optional[float] = None
-        episode_index = 0
+        episode_index = self._episode_index
         while episode_index < cfg.episodes:
             if (cfg.total_env_steps is not None
                     and self._env_steps >= cfg.total_env_steps):
@@ -676,6 +716,9 @@ class DCGTrainer:
                                         "coverage_rate": coverage_rate,
                                         "loss": last_loss if last_loss is not None else float("nan")},
                                        step=ep_idx + 1)
+                    if (ep_idx + 1) % cfg.save_every == 0:
+                        self._episode_index = episode_index
+                        self._save_checkpoint(Path(cfg.outdir) / "latest.pt")
                 episode_index += step_span
             else:
                 episode, reward, coverage_rate = self.collect_episode(episode_index)
@@ -693,11 +736,13 @@ class DCGTrainer:
                                     "coverage_rate": coverage_rate,
                                     "loss": last_loss if last_loss is not None else float("nan")},
                                    step=episode_index + 1)
+                if (episode_index + 1) % cfg.save_every == 0:
+                    self._episode_index = episode_index
+                    self._save_checkpoint(Path(cfg.outdir) / "latest.pt")
                 episode_index += 1
-        outdir = Path(cfg.outdir)
-        outdir.mkdir(parents=True, exist_ok=True)
-        torch.save({"network": self.network.state_dict(), "config": cfg.__dict__},
-                   outdir / "latest.pt")
+        # Final save (also pushed to W&B so it can be downloaded remotely).
+        self._episode_index = episode_index
+        self._save_checkpoint(Path(cfg.outdir) / "latest.pt")
         self.wandb.finish()
         self.env.close()
         if self.rollout is not None:
@@ -739,5 +784,7 @@ def run_dcg(args: Any) -> None:
         seed=args.seed,
         num_envs=getattr(args, "dcg_num_envs", 1),
         outdir=args.dcg_outdir,
+        save_every=getattr(args, "dcg_save_every", 50),
+        resume=getattr(args, "dcg_resume", None),
         wandb_api=args.wandb_api,
     )).train()

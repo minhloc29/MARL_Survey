@@ -42,6 +42,11 @@ class WandbLogger:
         if self._run is not None:
             self._run.log(data, step=step)
 
+    def save(self, path) -> None:
+        """Upload a file to the W&B run so it can be downloaded later."""
+        if self._run is not None:
+            self._run.save(str(path), policy="now")
+
     def finish(self) -> None:
         if self._run is not None:
             try:

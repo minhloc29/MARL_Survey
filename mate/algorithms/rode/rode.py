@@ -15,6 +15,7 @@ from flow.nets import MonotonicMixer
 from mate.algorithms.rode.environment import make_mate_rode_env
 from mate.algorithms.rode.replay import RODEEpisodeBuilder, RODEEpisodeReplay
 from mate.algorithms._wandb import WandbLogger
+from mate.algorithms._checkpoint import CheckpointMixin
 
 
 class RODENetwork(nn.Module):
@@ -72,10 +73,12 @@ class RODEConfig:
     seed: int = 0
     num_envs: int = 1
     outdir: str = "ckpts/rode"
+    save_every: int = 50          # episodes between periodic checkpoint saves
+    resume: Optional[str] = None  # path to a checkpoint to resume from
     wandb_api: Optional[str] = None
 
 
-class RODETrainer:
+class RODETrainer(CheckpointMixin):
     """Train RODE on MATE's discrete camera task."""
 
     def __init__(self, config: RODEConfig) -> None:
@@ -103,12 +106,33 @@ class RODETrainer:
         self.wandb = WandbLogger(
             "mate-rode", "rode", dict(config.__dict__), config.wandb_api)
         self._env_steps = 0
+        self._episode_index = 0
         self._batch_episodes = []
         self.rollout = None
         if config.num_envs > 1:
             from mate.algorithms.batched_rollout import BatchedRollout
             self.rollout = BatchedRollout(
                 lambda: _make_rode_vec_env(config), config.num_envs)
+        self.resume_checkpoint()
+
+    # --------------------------------------------- checkpointing hooks
+
+    def checkpoint_state(self) -> dict:
+        return {
+            "online": self.online.state_dict(),
+            "mixer": self.mixer.state_dict(),
+            "config": self.config.__dict__,
+            "env_steps": self._env_steps,
+            "episode_index": self._episode_index,
+        }
+
+    def restore_checkpoint(self, state: dict) -> None:
+        self.online.load_state_dict(state["online"])
+        self.target.load_state_dict(state["online"])
+        self.mixer.load_state_dict(state["mixer"])
+        self.target_mixer.load_state_dict(state["mixer"])
+        self._env_steps = int(state.get("env_steps", 0))
+        self._episode_index = int(state.get("episode_index", 0))
 
     def batched_act(self, payloads, hiddens, roles, ep_eps, training=True):
         """Actions for all slots from their obs + per-slot GRU hidden + roles.
@@ -273,7 +297,7 @@ class RODETrainer:
         return float(loss.detach().cpu())
 
     def train(self) -> None:
-        episode_index = 0
+        episode_index = self._episode_index
         while episode_index < self.config.episodes:
             # Honor a shared env-step budget (default 10M policy actions); each
             # episode consumes 1..episode_limit env steps.
@@ -301,6 +325,9 @@ class RODETrainer:
                     if (ep_idx + 1) % self.config.target_update_every == 0:
                         self.target.load_state_dict(self.online.state_dict())
                         self.target_mixer.load_state_dict(self.mixer.state_dict())
+                    if (ep_idx + 1) % self.config.save_every == 0:
+                        self._episode_index = ep_idx
+                        self.save_checkpoint()
                 episode_index += step_span
             else:
                 episode, reward, coverage_rate = self.collect_episode(episode_index)
@@ -317,10 +344,12 @@ class RODETrainer:
                 if (episode_index + 1) % self.config.target_update_every == 0:
                     self.target.load_state_dict(self.online.state_dict())
                     self.target_mixer.load_state_dict(self.mixer.state_dict())
+                if (episode_index + 1) % self.config.save_every == 0:
+                    self._episode_index = episode_index
+                    self.save_checkpoint()
                 episode_index += 1
-        Path(self.config.outdir).mkdir(parents=True, exist_ok=True)
-        torch.save({"online": self.online.state_dict(
-        ), "mixer": self.mixer.state_dict()}, Path(self.config.outdir) / "latest.pt")
+        self._episode_index = episode_index
+        self.save_checkpoint()
         self.wandb.finish()
         self.env.close()
         if self.rollout is not None:
@@ -359,5 +388,7 @@ def run_rode(args: Any) -> None:
         seed=args.seed,
         num_envs=getattr(args, "rode_num_envs", 1),
         outdir=args.rode_outdir,
+        save_every=getattr(args, "save_every", 50),
+        resume=getattr(args, "resume", None),
         wandb_api=args.wandb_api,
     )).train()

@@ -835,6 +835,10 @@ def main():
     parser.add_argument("--dcg-outdir", default="ckpts/dcg")
     parser.add_argument("--dcg-num-envs", type=int, default=1,
                         help="Number of parallel env processes for rollouts (>1 enables batched collection).")
+    parser.add_argument("--dcg-save-every", type=int, default=50,
+                        help="Save a checkpoint (and upload to W&B) every N episodes.")
+    parser.add_argument("--dcg-resume", default=None,
+                        help="Path to a saved DCG checkpoint to resume training from.")
     parser.add_argument("--i2c-config", default="MATE-4v8-9.yaml")
     parser.add_argument("--i2c-levels", type=int, default=3)
     parser.add_argument("--i2c-episode-limit", type=int, default=64)

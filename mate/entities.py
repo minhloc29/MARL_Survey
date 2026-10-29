@@ -665,7 +665,11 @@ class Target(Sensor):  # pylint: disable=too-many-instance-attributes
             min=consts.TERRAIN_SPACE.low, max=consts.TERRAIN_SPACE.high
         )
 
-        self.is_colliding = not np.allclose(self.location, desired_location, rtol=0.0, atol=1e-6)
+        # Exact equivalent of `not np.allclose(self.location, desired_location,
+        # rtol=0.0, atol=1e-6)`: with rtol=0, allclose is `|a - b| <= atol`,
+        # i.e. no element exceeds the tolerance. `np.isclose`/`np.allclose`
+        # are much more expensive for this scalar case.
+        self.is_colliding = bool(np.any(np.abs(self.location - desired_location) > 1e-6))
 
     @classmethod
     def add_obstacles(cls, *obstacles, epsilon=1e-5):  # pylint: disable=arguments-differ

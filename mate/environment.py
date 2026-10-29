@@ -953,62 +953,122 @@ class MultiAgentTracking(gym.Env, metaclass=EnvMeta):
         return self._state.copy()
 
     def joint_observation(self) -> Tuple[np.ndarray, np.ndarray]:  # pylint: disable=too-many-locals
-        """Joint observations of both teams."""
+        """Joint observations of both teams (vectorized)."""
 
-        if self.num_cameras > 0:
-            camera_states_public = np.vstack(list(map(Camera.state, self.cameras)))
-        else:
-            camera_states_public = np.zeros(
-                (self.num_cameras, consts.CAMERA_STATE_DIM_PUBLIC), dtype=np.float64
-            )
-        camera_states_public_flagged = np.hstack(
-            [camera_states_public, np.ones((self.num_cameras, 1), dtype=np.float64)]
-        )
+        cameras = self.cameras
+        targets = self.targets
+        num_targets = self.num_targets
+        num_cameras = self.num_cameras
 
-        target_states_public = np.vstack(list(map(Target.state, self.targets)))
+        # --- Target states, public & private, built directly (no scalar calls) ---
+        target_locs = np.vstack([t.location for t in targets])  # (T, 2)
+        target_sr = np.array([t.sight_range for t in targets])  # (T,)
+        target_goal_bits = np.stack([t.goal_bits for t in targets])  # (T, W)
+        target_empty_bits = np.stack([t.empty_bits for t in targets])  # (T, W)
+        target_loaded = target_goal_bits.astype(np.bool_).any(axis=1)  # (T,)
+        target_step = np.array([t.step_size for t in targets])  # (T,)
+        target_capacity = np.array([t.capacity for t in targets])  # (T,)
+
+        target_states_public = np.column_stack(
+            [target_locs, target_sr, target_loaded]
+        ).astype(np.float64)
         target_states_public_flagged = np.hstack(
-            [target_states_public, np.ones((self.num_targets, 1), dtype=np.float64)]
+            [target_states_public, np.ones((num_targets, 1), dtype=np.float64)]
         )
+        target_states_private = np.column_stack(
+            [
+                target_locs,
+                target_sr,
+                target_loaded.astype(np.float64),
+                target_step,
+                target_capacity,
+                target_goal_bits,
+                target_empty_bits,
+            ]
+        ).astype(np.float64)
 
-        if self.num_cameras > 0:
-            camera_joint_observation = []
-            for c, camera in enumerate(self.cameras):
-                camera_observation = [self.preserved_data, camera.state(private=True)]
-                target_mask = self.camera_target_view_mask[c, :, np.newaxis]
-                camera_observation.append(
-                    np.where(target_mask, target_states_public_flagged, 0.0).ravel()
-                )
-                camera_observation.append(self.camera_obstacle_observations[c])
-                camera_mask = self.camera_camera_view_mask[c, :, np.newaxis]
-                camera_observation.append(
-                    np.where(camera_mask, camera_states_public_flagged, 0.0).ravel()
-                )
-                camera_joint_observation.append(np.concatenate(camera_observation))
-            camera_joint_observation = np.vstack(camera_joint_observation)
-            camera_joint_observation[:, 3] = np.arange(self.num_cameras, dtype=np.float64)
+        if num_cameras > 0:
+            # --- Camera states, public & private, built directly ---
+            camera_locs = np.vstack([c.location for c in cameras])  # (C, 2)
+            camera_radii = np.array([c.radius for c in cameras])  # (C,)
+            camera_sr = np.array([c.sight_range for c in cameras])  # (C,)
+            camera_ori = np.array([c.orientation for c in cameras])  # (C,)
+            camera_view = np.array([c.viewing_angle for c in cameras])  # (C,)
+            phi = np.deg2rad(camera_ori)
+            camera_dir = camera_sr[:, None] * np.stack(
+                [np.cos(phi), np.sin(phi)], axis=1
+            )  # (C, 2) == polar2cartesian(sight_range, orientation)
+
+            camera_states_public = np.column_stack(
+                [camera_locs, camera_radii, camera_dir, camera_view]
+            ).astype(np.float64)
+            camera_states_public_flagged = np.hstack(
+                [camera_states_public, np.ones((num_cameras, 1), dtype=np.float64)]
+            )
+            camera_states_private = np.column_stack(
+                [
+                    camera_states_public,
+                    np.array([c.max_sight_range for c in cameras]),
+                    np.array([c.rotation_step for c in cameras]),
+                    np.array([c.zooming_step for c in cameras]),
+                ]
+            ).astype(np.float64)
+
+            # Camera observation blocks (columns): preserved | self private |
+            # masked targets | obstacle observations | masked cameras.
+            # Boolean-mask multiplication is bit-identical to
+            # `np.where(mask, values, 0.0)`.
+            cam_target_block = (
+                self.camera_target_view_mask[:, :, np.newaxis]
+                * target_states_public_flagged[np.newaxis, :, :]
+            ).reshape(num_cameras, -1)
+            cam_camera_block = (
+                self.camera_camera_view_mask[:, :, np.newaxis]
+                * camera_states_public_flagged[np.newaxis, :, :]
+            ).reshape(num_cameras, -1)
+
+            camera_joint_observation = np.concatenate(
+                [
+                    np.tile(self.preserved_data, (num_cameras, 1)),
+                    camera_states_private,
+                    cam_target_block,
+                    self.camera_obstacle_observations,
+                    cam_camera_block,
+                ],
+                axis=1,
+            )
+            camera_joint_observation[:, 3] = np.arange(num_cameras, dtype=np.float64)
         else:
             camera_joint_observation = np.zeros(
-                (self.num_cameras, self.camera_observation_dim), dtype=np.float64
+                (num_cameras, self.camera_observation_dim), dtype=np.float64
             )
 
-        target_joint_observation = []
-        for t, target in enumerate(self.targets):
-            target_observation = [self.preserved_data, target.state(private=True)]
-            camera_mask = self.target_camera_view_mask[t, :, np.newaxis]
-            target_observation.append(
-                np.where(camera_mask, camera_states_public_flagged, 0.0).ravel()
-            )
-            obstacle_mask = self.target_obstacle_view_mask[t, :, np.newaxis]
-            target_observation.append(
-                np.where(obstacle_mask, self.obstacle_states_flagged, 0.0).ravel()
-            )
-            target_mask = self.target_target_view_mask[t, :, np.newaxis]
-            target_observation.append(
-                np.where(target_mask, target_states_public_flagged, 0.0).ravel()
-            )
-            target_joint_observation.append(np.concatenate(target_observation))
-        target_joint_observation = np.vstack(target_joint_observation)
-        target_joint_observation[:, 3] = np.arange(self.num_targets, dtype=np.float64)
+        obstacle_flagged = self.obstacle_states_flagged
+
+        tar_camera_block = (
+            self.target_camera_view_mask[:, :, np.newaxis]
+            * camera_states_public_flagged[np.newaxis, :, :]
+        ).reshape(num_targets, -1)
+        tar_obstacle_block = (
+            self.target_obstacle_view_mask[:, :, np.newaxis]
+            * obstacle_flagged[np.newaxis, :, :]
+        ).reshape(num_targets, -1)
+        tar_target_block = (
+            self.target_target_view_mask[:, :, np.newaxis]
+            * target_states_public_flagged[np.newaxis, :, :]
+        ).reshape(num_targets, -1)
+
+        target_joint_observation = np.concatenate(
+            [
+                np.tile(self.preserved_data, (num_targets, 1)),
+                target_states_private,
+                tar_camera_block,
+                tar_obstacle_block,
+                tar_target_block,
+            ],
+            axis=1,
+        )
+        target_joint_observation[:, 3] = np.arange(num_targets, dtype=np.float64)
 
         with_bounty_bits = self.bounties > 0
         num_with_bounty = with_bounty_bits.sum()
@@ -1321,13 +1381,20 @@ class MultiAgentTracking(gym.Env, metaclass=EnvMeta):
         target_team_reward = -float(np.logical_and(self.tracked_bits, self.bounties > 0).sum())
         self.bounties = np.maximum(self.bounties - self.tracked_bits, 0).astype(np.int64)
 
+        # Vectorized per-target warehouse distances / supremum norms, computed
+        # once for all targets instead of per-target (4, 2) allocations. The
+        # serial reward loop below keeps the exact same target/warehouse order
+        # and RNG draw sequence.
+        target_locations = np.vstack([target.location for target in self.targets])  # (T, 2)
+        rel = target_locations[:, None, :] - consts.WAREHOUSES[None, :, :]  # (T, W, 2)
+        self.target_warehouse_distances = np.linalg.norm(rel, axis=-1)  # (T, W)  2-norm
+        supremum = np.linalg.norm(rel, ord=np.inf, axis=-1)  # (T, W)  inf-norm
+        in_warehouse = supremum <= consts.WAREHOUSE_RADIUS  # (T, W) bool
+
         for t, (goal, capacity, target) in enumerate(
             zip(self.target_goals, self.target_capacities, self.targets)
         ):
-            directions = target.location - consts.WAREHOUSES
-            self.target_warehouse_distances[t] = np.linalg.norm(directions, axis=-1)
-            supremum = np.linalg.norm(directions, ord=np.inf, axis=-1)
-            for warehouse in np.flatnonzero(supremum <= consts.WAREHOUSE_RADIUS):
+            for warehouse in np.flatnonzero(in_warehouse[t]):
                 if goal >= 0:
                     if goal == warehouse:
                         cargo_weight = self.target_goal_bits[t, goal]
@@ -1360,7 +1427,7 @@ class MultiAgentTracking(gym.Env, metaclass=EnvMeta):
                     self.target_goals[t] = new_goal
                     break
 
-            for warehouse in np.flatnonzero(supremum <= consts.WAREHOUSE_RADIUS):
+            for warehouse in np.flatnonzero(in_warehouse[t]):
                 target.empty_bits[warehouse] = not self.remaining_cargoes[warehouse].any()
 
         self.target_dones = np.logical_and(
@@ -1399,7 +1466,21 @@ class MultiAgentTracking(gym.Env, metaclass=EnvMeta):
 
         self._update_view()
 
-    def _update_view(self) -> None:  # pylint: disable=too-many-branches
+    def _update_view(self) -> None:  # pylint: disable=too-many-branches,too-many-locals,too-many-statements
+        """Vectorized update of all visibility masks.
+
+        This is a performance-oriented rewrite of the original pair-wise Python
+        loops. It computes the pairwise distances / angles and view checks on
+        full matrices, replacing hundreds of small scalar NumPy calls per step.
+
+        Determinism note: the stochastic "perceive through an obstacle" check
+        (``camera.np_random.binomial(1, transmittance)``) is preserved exactly.
+        Each camera has its own RNG and draws, in the original order, one
+        binomial per camera->target pair that passes the window check and then
+        one per camera->camera pair (with ``transmittance=0``, matching the
+        original ``perceive`` default). Bit-for-bit RNG compatibility is kept.
+        """
+
         self._state = None
         self.camera_target_view_mask.fill(False)
         self.target_camera_view_mask.fill(False)
@@ -1407,29 +1488,93 @@ class MultiAgentTracking(gym.Env, metaclass=EnvMeta):
         self.camera_camera_view_mask.fill(False)
         self.target_target_view_mask.fill(False)
 
-        for t, target in enumerate(self.targets):
-            for c, camera in enumerate(self.cameras):
-                if camera.perceive(target, transmittance=self.obstacle_transmittance):
-                    self.camera_target_view_mask[c, t] = True
-                if target.perceive(camera):
-                    self.target_camera_view_mask[t, c] = True
+        num_targets = self.num_targets
+        target_locs = np.vstack([target.location for target in self.targets])  # (T, 2)
+        target_sr = np.array([target.sight_range for target in self.targets])  # (T,)
 
-            for o, obstacle in enumerate(self.obstacles):
-                if target.perceive(obstacle):
-                    self.target_obstacle_view_mask[t, o] = True
+        # target sees target (diagonal is always true, combined afterwards).
+        if num_targets > 1:
+            rel_tt = target_locs[:, None, :] - target_locs[None, :, :]  # (T, T, 2)
+            tt_norm = np.linalg.norm(rel_tt, axis=-1)
+            self.target_target_view_mask = tt_norm <= target_sr[:, None]
+        self.target_target_view_mask[
+            np.arange(num_targets), np.arange(num_targets)
+        ] = True
 
-            for t_other, target_other in enumerate(self.targets):
-                if t == t_other:
-                    self.target_target_view_mask[t, t] = True
-                elif target.perceive(target_other):
-                    self.target_target_view_mask[t, t_other] = True
+        if self.num_obstacles > 0:
+            obstacle_locs = np.vstack([o.location for o in self.obstacles])  # (O, 2)
+            obstacle_radii = np.array(
+                [o.radius for o in self.obstacles], dtype=np.float64
+            )  # (O,)
+            rel_to = target_locs[:, None, :] - obstacle_locs[None, :, :]  # (T, O, 2)
+            to_norm = np.linalg.norm(rel_to, axis=-1)
+            self.target_obstacle_view_mask = (
+                to_norm <= target_sr[:, None] + obstacle_radii[None, :]
+            )
 
-        for c, camera in enumerate(self.cameras):
-            for c_other, camera_other in enumerate(self.cameras):
-                if c == c_other:
-                    self.camera_camera_view_mask[c, c] = True
-                elif camera.perceive(camera_other):
-                    self.camera_camera_view_mask[c, c_other] = True
+        if self.num_cameras > 0:
+            camera_locs = np.vstack([c.location for c in self.cameras])  # (C, 2)
+            camera_sr = np.array([c.sight_range for c in self.cameras])  # (C,)
+            camera_ori = np.array([c.orientation for c in self.cameras])  # (C,)
+            camera_view = np.array([c.viewing_angle for c in self.cameras])  # (C,)
+            camera_radii = np.array([c.radius for c in self.cameras])  # (C,)
+            transmittance = self.obstacle_transmittance
+
+            # camera -> target window check (range + viewing angle).
+            rel_ct = target_locs[None, :, :] - camera_locs[:, None, :]  # (C, T, 2)
+            ct_norm = np.linalg.norm(rel_ct, axis=-1)  # (C, T)
+            ct_ang = np.rad2deg(np.arctan2(rel_ct[..., 1], rel_ct[..., 0]))
+            diff_ct = camera_ori[:, None] - ct_ang
+            ct_relative_angle = np.minimum(np.abs(diff_ct), 360.0 - np.abs(diff_ct))
+            ct_pre = (ct_norm <= camera_sr[:, None]) & (
+                2.0 * ct_relative_angle <= camera_view[:, None]
+            )
+
+            # camera -> camera window check (diagonal excluded).
+            rel_cc = camera_locs[None, :, :] - camera_locs[:, None, :]  # (C, C, 2)
+            cc_norm = np.linalg.norm(rel_cc, axis=-1)  # (C, C)
+            cc_ang = np.rad2deg(np.arctan2(rel_cc[..., 1], rel_cc[..., 0]))
+            diff_cc = camera_ori[:, None] - cc_ang
+            cc_relative_angle = np.minimum(np.abs(diff_cc), 360.0 - np.abs(diff_cc))
+            cc_pre = (cc_norm <= camera_sr[:, None]) & (
+                2.0 * cc_relative_angle <= camera_view[:, None]
+            )
+            np.fill_diagonal(cc_pre, False)
+
+            # Per-camera stochastic occlusion: exact original default order is
+            # [windows camera->target draws] then [camera->camera draws]. The
+            # camera->camera draws use transmittance = 0.0 (``perceive`` default).
+            ct_rhos = np.zeros_like(ct_norm)
+            cc_rhos = np.zeros_like(cc_norm)
+            ct_see = np.zeros(ct_pre.shape, dtype=np.bool_)
+            cc_see = np.zeros(cc_pre.shape, dtype=np.bool_)
+            for c in range(self.num_cameras):
+                camera = self.cameras[c]
+                t_pass = np.flatnonzero(ct_pre[c])
+                co_pass = np.flatnonzero(cc_pre[c])
+                if t_pass.size > 0:
+                    draws = camera.np_random.binomial(1, transmittance, size=t_pass.size)
+                    ct_see[c, t_pass] = draws != 0
+                    ct_rhos[c, t_pass] = camera.sight_range_func(ct_ang[c, t_pass])
+                if co_pass.size > 0:
+                    draws = camera.np_random.binomial(1, 0.0, size=co_pass.size)
+                    cc_see[c, co_pass] = draws != 0
+                    cc_rhos[c, co_pass] = camera.sight_range_func(cc_ang[c, co_pass])
+
+            self.camera_target_view_mask = ct_pre & (
+                ct_see | (ct_norm <= ct_rhos * (1 + 1e-6))
+            )
+            self.camera_camera_view_mask = cc_pre & (
+                cc_see | (cc_norm <= cc_rhos * (1 + 1e-6))
+            )
+            self.camera_camera_view_mask[
+                np.arange(self.num_cameras), np.arange(self.num_cameras)
+            ] = True
+
+            # target sees camera (pure distance check, no RNG).
+            self.target_camera_view_mask = (ct_norm.transpose()) <= (
+                target_sr[:, None] + camera_radii[None, :]
+            )
 
         self.tracked_bits = self.camera_target_view_mask.any(axis=0)
 
